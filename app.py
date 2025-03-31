@@ -1,40 +1,61 @@
 import os
 import streamlit as st
 import time
-import requests
+import base64
 import json
-import random
+import requests
+import tempfile
 import logging
-import pandas as pd
-import sys
 import traceback
+import io
+import sys
 from datetime import datetime
-from functools import wraps
+from pathlib import Path
+from io import BytesIO
+from PIL import Image
+from openai import OpenAI
+import uuid
+import streamlit.components.v1 as components
 
-# Configuración avanzada de logging con rotación de archivos
+# Configuración avanzada de logging - Implementación multi-destino
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"consentlex_{datetime.now().strftime('%Y%m%d')}.log")
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - consentlex - %(levelname)s - %(message)s - %(pathname)s:%(lineno)d",
-    handlers=[logging.StreamHandler()],
+    format="%(asctime)s - consentlex - %(levelname)s [%(filename)s:%(lineno)d] - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(log_file)
+    ]
 )
 
 # Versión de la aplicación
-APP_VERSION = "1.0.0"
-LAST_UPDATE = datetime.now().strftime("%Y-%m-%d")
+APP_VERSION = "3.3.0"
 
-# ---- SISTEMA DE RECUPERACIÓN Y RESILIENCIA ----
+# Configuración de página Streamlit
+st.set_page_config(
+    page_title="ConsentLex | Experto en Consentimiento Informado",
+    page_icon="⚖️",
+    layout="wide",
+    initial_sidebar_state="collapsed",  # Menú lateral contraído por defecto
+    menu_items={
+        "Get Help": "https://www.consentlex.com/help",
+        "Report a bug": None,
+        "About": "ConsentLex: Sistema experto para análisis y creación de consentimientos informados médico-legales.",
+    },
+)
 
-def with_error_handling(max_retries=3, recovery_delay=1.0):
+# Decorador para manejo de errores con retries
+def handle_error(max_retries=2):
     """
-    Decorador para funciones críticas que implementa reintentos automáticos
-    y manejo de errores avanzado.
+    Decorador avanzado para manejo de errores con capacidad de reintento
     
-    Args:
-        max_retries: Número máximo de reintentos
-        recovery_delay: Tiempo entre reintentos (aumenta exponencialmente)
+    Parámetros:
+        max_retries: Número máximo de reintentos ante fallos
     """
     def decorator(func):
-        @wraps(func)
         def wrapper(*args, **kwargs):
             retries = 0
             last_exception = None
@@ -44,2013 +65,1553 @@ def with_error_handling(max_retries=3, recovery_delay=1.0):
                     return func(*args, **kwargs)
                 except Exception as e:
                     last_exception = e
-                    retries += 1
-                    if retries <= max_retries:
-                        delay = recovery_delay * (2 ** (retries - 1))  # Backoff exponencial
-                        logging.warning(
-                            f"Error en {func.__name__}, reintento {retries}/{max_retries} "
-                            f"después de {delay:.2f}s: {str(e)}"
-                        )
-                        time.sleep(delay)
+                    error_msg = f"Error en {func.__name__} (intento {retries+1}/{max_retries+1}): {str(e)}"
+                    logging.error(error_msg)
+                    
+                    if retries < max_retries:
+                        logging.info(f"Reintentando {func.__name__}...")
+                        retries += 1
+                        time.sleep(1)  # Espera antes de reintentar
                     else:
-                        logging.error(
-                            f"Error persistente en {func.__name__} después de {max_retries} "
-                            f"intentos: {str(e)}"
-                        )
-            
-            # Si llegamos aquí, todos los reintentos fallaron
-            if last_exception:
-                error_trace = "".join(traceback.format_exception(
-                    type(last_exception), last_exception, last_exception.__traceback__
-                ))
-                logging.error(f"Traza de error completa:\n{error_trace}")
-            
-            raise last_exception
-        
+                        logging.error(f"Error final después de {max_retries+1} intentos: {traceback.format_exc()}")
+                        st.error(error_msg)
+                        break
+                        
+            return None
         return wrapper
-    
     return decorator
 
-# Intenta importar la biblioteca OpenAI con manejo de errores
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-    logging.info("Biblioteca OpenAI importada correctamente")
-except ImportError:
-    OPENAI_AVAILABLE = False
-    logging.error("No se pudo importar OpenAI. Intentando instalar automáticamente...")
+# Sistema multicapa para reinicio de la aplicación
+def rerun_app():
+    """
+    Sistema multicapa para reiniciar la aplicación Streamlit.
+    Implementa múltiples estrategias de recuperación en caso de fallo.
+    """
     try:
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "openai"])
-        from openai import OpenAI
-        OPENAI_AVAILABLE = True
-        logging.info("OpenAI instalado y cargado correctamente")
-    except Exception as e:
-        logging.error(f"No se pudo instalar OpenAI: {str(e)}")
-
-# Intenta importar los componentes opcionales con manejo de errores
-try:
-    from streamlit_lottie import st_lottie
-    LOTTIE_AVAILABLE = True
-    logging.info("Componente streamlit_lottie cargado correctamente")
-except ImportError:
-    LOTTIE_AVAILABLE = False
-    logging.warning("Componente streamlit_lottie no disponible. Intentando instalar...")
-    try:
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "streamlit-lottie"])
-        from streamlit_lottie import st_lottie
-        LOTTIE_AVAILABLE = True
-        logging.info("streamlit-lottie instalado y cargado correctamente")
-    except Exception as e:
-        logging.warning(f"No se pudo instalar streamlit-lottie: {str(e)}")
-
-try:
-    from streamlit_option_menu import option_menu
-    OPTION_MENU_AVAILABLE = True
-    logging.info("Componente streamlit_option_menu cargado correctamente")
-except ImportError:
-    OPTION_MENU_AVAILABLE = False
-    logging.warning("Componente streamlit_option_menu no disponible. Intentando instalar...")
-    try:
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "streamlit-option-menu"])
-        from streamlit_option_menu import option_menu
-        OPTION_MENU_AVAILABLE = True
-        logging.info("streamlit-option-menu instalado y cargado correctamente")
-    except Exception as e:
-        logging.warning(f"No se pudo instalar streamlit-option-menu: {str(e)}")
-
-# Configuración de la página
-st.set_page_config(
-    page_title="ConsentLex ⚖️ | Experto en Consentimiento Informado",
-    page_icon="⚖️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-    menu_items={
-        "Get Help": "https://www.consentlex.com/help",
-        "Report a bug": None,
-        "About": "ConsentLex: Sistema experto para análisis y creación de consentimientos informados médico-legales.",
-    },
-)
-
-# ----- SISTEMA DE DETECCIÓN DE ENTORNO Y CONFIGURACIÓN ADAPTATIVA -----
-
-def detect_environment():
-    """
-    Detecta el entorno de ejecución de manera confiable usando múltiples indicadores
-    para maximizar la compatibilidad con Streamlit Cloud.
-    
-    Returns:
-        str: "Streamlit Cloud" o "Local"
-    """
-    # Métodos múltiples para detectar Streamlit Cloud
-    streamlit_cloud_indicators = [
-        os.environ.get("STREAMLIT_SHARING_MODE") is not None,
-        os.environ.get("STREAMLIT_SERVER_BASE_URL_IS_SET") is not None,
-        os.environ.get("IS_STREAMLIT_CLOUD") == "true",
-        os.path.exists("/.streamlit/config.toml"),  # Común en entornos cloud
-        os.environ.get("HOSTNAME", "").startswith("st-"),  # Algunos hosts Streamlit comienzan con st-
-        not os.path.exists(os.path.join(os.path.expanduser("~"), ".streamlit")),  # Ausencia de config local
-    ]
-    
-    # Verificar si el entorno aparenta ser Streamlit Cloud
-    is_streamlit_cloud_by_indicators = any(streamlit_cloud_indicators)
-    
-    # Verificación adicional basada en la estructura de directorios
-    try:
-        import tempfile
-        temp_dir = tempfile.gettempdir()
-        # En Streamlit Cloud, el directorio temp suele tener una estructura específica
-        is_cloud_by_temp = "/tmp" in temp_dir and not os.path.exists("/Users") and not os.path.exists("/home/user")
-    except:
-        is_cloud_by_temp = False
-    
-    # Combinación de verificaciones
-    is_streamlit_cloud = is_streamlit_cloud_by_indicators or is_cloud_by_temp
-    
-    # Log para debugging
-    logging.info(f"Detección de entorno - Indicadores de Streamlit Cloud: {streamlit_cloud_indicators}")
-    logging.info(f"Detección por directorio temporal: {is_cloud_by_temp}")
-    logging.info(f"Entorno detectado: {'Streamlit Cloud' if is_streamlit_cloud else 'Local'}")
-    
-    # Forzar el entorno basado en variables de entorno si existen (para pruebas o sobrescritura)
-    if os.environ.get("FORCE_ENVIRONMENT") == "cloud":
-        logging.info("Entorno forzado a Streamlit Cloud por variable de entorno")
-        return "Streamlit Cloud"
-    elif os.environ.get("FORCE_ENVIRONMENT") == "local":
-        logging.info("Entorno forzado a Local por variable de entorno")
-        return "Local"
-    
-    return "Streamlit Cloud" if is_streamlit_cloud else "Local"
-
-def get_proxy_settings():
-    """
-    Detecta y devuelve la configuración de proxy actual del sistema
-    para diagnóstico y posible resolución de problemas.
-    """
-    proxy_env_vars = ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"]
-    proxy_settings = {}
-    
-    for var in proxy_env_vars:
-        if var in os.environ:
-            proxy_settings[var] = os.environ[var]
-    
-    return proxy_settings
-
-def get_system_info():
-    """
-    Recopila información detallada del sistema para diagnóstico.
-    """
-    import platform
-    
-    info = {
-        "Sistema Operativo": platform.platform(),
-        "Python Versión": sys.version,
-        "Ejecutable Python": sys.executable,
-        "Directorio de Trabajo": os.getcwd(),
-        "Directorio Temporal": os.path.abspath(os.path.join(os.getcwd(), "temp")) if os.path.exists(os.path.join(os.getcwd(), "temp")) else "No disponible",
-        "Directorio de Usuario": os.path.expanduser("~"),
-        "Variables PATH relevantes": {k: v for k, v in os.environ.items() if "PATH" in k.upper()},
-    }
-    
-    # Verificar si podemos acceder a ciertos directorios
-    try:
-        import tempfile
-        info["Directorio Temp"] = tempfile.gettempdir()
-        info["Acceso Directorio Temp"] = os.access(tempfile.gettempdir(), os.W_OK)
-    except Exception as e:
-        info["Error acceso Temp"] = str(e)
-    
-    return info
-
-# ----- FUNCIÓN OPTIMIZADA PARA CREAR CLIENTE OPENAI -----
-
-@with_error_handling(max_retries=2)
-def create_openai_client(api_key):
-    """
-    Crea un cliente OpenAI compatible con múltiples entornos.
-    Implementa estrategias específicas para cada entorno y mecanismos avanzados
-    de recuperación ante errores.
-    
-    Args:
-        api_key: API key de OpenAI
+        # Método 1 (preferido): Función actual en Streamlit
+        st.rerun()
+    except (AttributeError, Exception) as e:
+        logging.warning(f"Método primario de reinicio falló: {str(e)}")
         
-    Returns:
-        OpenAI: Cliente de OpenAI inicializado
-    
-    Raises:
-        Exception: Si no se puede crear el cliente después de varios intentos
-    """
-    if not OPENAI_AVAILABLE:
-        raise Exception(
-            "La biblioteca OpenAI no está disponible. Por favor, instala 'openai' "
-            "usando pip: pip install openai"
-        )
-    
-    try:
-        # Detectar entorno para aplicar estrategia específica
-        environment = detect_environment()
-        logging.info(f"Creando cliente OpenAI para entorno: {environment}")
+        # Método 2: Mensaje al usuario con opción manual
+        st.info("Por favor, recarga la página para ver los cambios")
         
-        # Verificar si estamos en Streamlit Cloud
-        if environment == "Streamlit Cloud":
-            # Estrategia ultra segura para Streamlit Cloud
-            try:
-                logging.info("Usando estrategia de creación minimizada para Streamlit Cloud")
-                # Crear un diccionario de kwargs limpio con solo la API key
-                # Esta es la estrategia más segura para evitar parámetros no soportados
-                clean_kwargs = {'api_key': api_key}
-                
-                client = OpenAI(**clean_kwargs)
-            except Exception as cloud_error:
-                logging.error(f"Error con estrategia principal para Cloud: {str(cloud_error)}")
-                
-                if 'proxies' in str(cloud_error).lower():
-                    # Intento de recuperación específico para error de proxies
-                    logging.info("Intentando método alternativo por error de proxies")
-                    
-                    # Método 1: Inicialización por etapas (más seguro para algunas versiones)
-                    try:
-                        client = object.__new__(OpenAI)
-                        client.api_key = api_key
-                        # Configuración mínima requerida
-                        if hasattr(client, "default_headers"):
-                            client.default_headers = {"OpenAI-Beta": "assistants=v2"}
-                        logging.info("Cliente creado usando inicialización por etapas")
-                        return client
-                    except Exception as e1:
-                        logging.warning(f"Falló inicialización por etapas: {str(e1)}")
-                        
-                        # Método 2: Creación directa con bypass de __init__
-                        try:
-                            import types
-                            # Crear instancia y establecer atributos mínimos manualmente
-                            client = OpenAI.__new__(OpenAI)
-                            client.api_key = api_key
-                            client.default_headers = {"OpenAI-Beta": "assistants=v2"}
-                            logging.info("Cliente creado usando bypass de __init__")
-                            return client
-                        except Exception as e2:
-                            logging.error(f"Fallaron todos los métodos de recuperación: {str(e2)}")
-                            raise
-                else:
-                    # Reintento con otros métodos si el error no es específicamente sobre proxies
-                    raise
-        else:
-            # Estrategia estándar para entorno local
-            logging.info("Creando cliente OpenAI con configuración estándar para entorno local")
-            client = OpenAI(api_key=api_key)
-        
-        # Configuración común post-creación
-        if hasattr(client, "default_headers"):
-            client.default_headers["OpenAI-Beta"] = "assistants=v2"
-            logging.info("Encabezado OpenAI-Beta establecido para asistentes v2")
-        
-        # Verificación básica de funcionamiento
-        logging.info("Verificando cliente OpenAI creado correctamente")
-        return client
-    
-    except Exception as e:
-        # Traza completa para depuración
-        error_trace = traceback.format_exc()
-        logging.error(f"Error crítico al crear cliente OpenAI: {str(e)}")
-        logging.debug(f"Traza de error completa:\n{error_trace}")
-        
-        # Elevar excepción con mensaje claro
-        raise Exception(f"No se pudo inicializar el cliente OpenAI: {str(e)}")
-
-
-# ----- FUNCIONES AUXILIARES -----
-
-@with_error_handling()
-def test_openai_connection():
-    """Prueba la conexión a la API de OpenAI con compatibilidad v2"""
-    try:
-        if not st.session_state.get("openai_api_key"):
-            return "❌ Sin configurar", "API key no configurada"
-
-        # Usar función simplificada para crear el cliente
-        client = create_openai_client(st.session_state.get("openai_api_key"))
-
-        # Prueba simple de conexión sin parámetros adicionales
+        # Método 3: Intento con JavaScript nativo
         try:
-            response = client.models.list()
-            if response and len(response.data) > 0:
-                modelo_preferido = st.session_state.get("openai_model", "gpt-4o-mini")
-                return "✅ Conectado", f"Modelo configurado: {modelo_preferido}"
-            else:
-                return "⚠️ Respuesta vacía", "La API respondió pero sin datos"
-        except Exception as test_error:
-            logging.error(f"Error en prueba de modelos: {str(test_error)}")
-            # Intento alternativo de verificación de conexión
-            try:
-                # Prueba minimalista como fallback
-                client.api_key = st.session_state.get("openai_api_key")
-                return "⚠️ Conexión básica", "Verificación limitada completada"
-            except:
-                return "⚠️ Verificación limitada", "Conexión establecida pero verificación limitada"
-    except Exception as e:
-        logging.error(f"Error en prueba de conexión OpenAI: {str(e)}")
-        return "❌ Error", f"Error: {str(e)}"
+            html_code = """
+            <script>
+                // Reintento con un retraso para permitir renderización
+                setTimeout(function() {
+                    window.parent.location.reload();
+                }, 2000);
+            </script>
+            """
+            st.components.v1.html(html_code, height=0, width=0)
+        except Exception as e3:
+            logging.error(f"Reinicio con JavaScript falló: {str(e3)}")
 
-
-@with_error_handling()
-def test_lottiefiles_connection():
-    """Prueba la conexión a LottieFiles"""
+# Detectar entorno de ejecución
+def is_streamlit_cloud():
+    """
+    Detecta si la aplicación se está ejecutando en Streamlit Cloud
+    con verificación multi-indicador
+    """
     try:
-        # URL conocida y funcional
-        url = "https://assets10.lottiefiles.com/packages/lf20_ydo1amjm.json"
-        r = requests.get(url, timeout=5)
-        if r.status_code == 200:
-            return "✅ Conectado", f"Status: {r.status_code}"
-        else:
-            return "⚠️ Respuesta error", f"Status: {r.status_code}"
-    except Exception as e:
-        return "❌ Error", f"Error: {str(e)}"
-
-
-@with_error_handling()
-def load_lottie_with_fallback():
-    """Sistema robusto para cargar animaciones Lottie con múltiples fallbacks"""
-    # Lista de URLs alternativas para ConsentLex (balanzas, símbolos legales)
-    lottie_urls = [
-        "https://assets3.lottiefiles.com/packages/lf20_dT1E1G.json",  # Balanza de justicia
-        "https://assets5.lottiefiles.com/packages/lf20_w51pcehl.json",  # Documento legal
-        "https://assets9.lottiefiles.com/packages/lf20_mk3pbeqr.json",  # Firma de documento
-        "https://assets10.lottiefiles.com/packages/lf20_ydo1amjm.json",  # Animación genérica
-    ]
-
-    # Intenta cada URL hasta encontrar una que funcione
-    for url in lottie_urls:
-        try:
-            logging.info(f"Intentando cargar animación desde: {url}")
-            r = requests.get(url, timeout=5)
-            if r.status_code == 200:
-                logging.info(f"Animación cargada exitosamente desde: {url}")
-                return r.json()
-            else:
-                logging.warning(
-                    f"Error al cargar animación (código {r.status_code}): {url}"
-                )
-        except Exception as e:
-            logging.error(f"Excepción al cargar animación desde {url}: {str(e)}")
-
-    # Si ninguna funciona, devuelve None para manejar con una imagen estática
-    logging.warning("No se pudo cargar ninguna animación. Se usará imagen estática.")
-    return None
-
-
-@with_error_handling()
-def load_sidebar_lottie():
-    """Carga animación específica para la barra lateral con múltiples alternativas"""
-    urls = [
-        "https://assets5.lottiefiles.com/packages/lf20_w51pcehl.json",  # Documento legal
-        "https://assets3.lottiefiles.com/packages/lf20_dT1E1G.json",  # Balanza de justicia
-        "https://assets9.lottiefiles.com/packages/lf20_mk3pbeqr.json",  # Firma de documento
-    ]
-
-    for url in urls:
-        try:
-            logging.info(f"Intentando cargar animación de sidebar desde: {url}")
-            r = requests.get(url, timeout=5)
-            if r.status_code == 200:
-                logging.info(f"Animación de sidebar cargada desde: {url}")
-                return r.json()
-            else:
-                logging.warning(
-                    f"Error al cargar animación de sidebar (código {r.status_code}): {url}"
-                )
-        except Exception as e:
-            logging.error(f"Error cargando animación de sidebar desde {url}: {str(e)}")
-
-    return None
-
-
-@with_error_handling()
-def load_welcome_lottie():
-    """Carga animación de bienvenida con múltiples alternativas"""
-    urls = [
-        "https://assets3.lottiefiles.com/packages/lf20_dT1E1G.json",  # Balanza de justicia
-        "https://assets9.lottiefiles.com/packages/lf20_mk3pbeqr.json",  # Firma de documento
-        "https://assets6.lottiefiles.com/private_files/lf30_bb9bq9.json",  # Alternativa confiable
-    ]
-
-    for url in urls:
-        try:
-            logging.info(f"Intentando cargar animación de bienvenida desde: {url}")
-            r = requests.get(url, timeout=5)
-            if r.status_code == 200:
-                logging.info(f"Animación de bienvenida cargada desde: {url}")
-                return r.json()
-            else:
-                logging.warning(
-                    f"Error al cargar animación de bienvenida (código {r.status_code}): {url}"
-                )
-        except Exception as e:
-            logging.error(
-                f"Error cargando animación de bienvenida desde {url}: {str(e)}"
-            )
-
-    return None
-
-
-def get_random_legal_tip():
-    """Devuelve un consejo legal aleatorio sobre consentimientos informados"""
-    tips = [
-        "Un consentimiento informado debe ser obtenido antes de realizar cualquier procedimiento médico no urgente.",
-        "El lenguaje técnico excesivo puede invalidar un consentimiento informado. La claridad es esencial.",
-        "La normativa colombiana exige que toda intervención quirúrgica cuente con un consentimiento por escrito.",
-        "No basta con la firma: el médico debe verificar que el paciente comprenda lo que está autorizando.",
-        "Un consentimiento informado sin fecha o con espacios en blanco puede considerarse legalmente deficiente.",
-        "La Ley 23 de 1981 establece la obligatoriedad del consentimiento informado en la práctica médica.",
-        "El consentimiento otorgado bajo presión o sin tiempo suficiente para reflexionar puede ser impugnado.",
-        "Según la Resolución 8430 de 1993, el consentimiento debe explicar los procedimientos alternativos razonables.",
-        "Para menores de edad, la Resolución 309 de 2025 establece el principio de autonomía progresiva.",
-        "Un buen consentimiento informado es tanto una protección legal para el médico como un derecho del paciente.",
-    ]
-    return random.choice(tips)
-
-
-@with_error_handling()
-def process_message_with_citations(message):
-    """Extrae y devuelve solo el texto del mensaje del asistente, con manejo de errores mejorado."""
-    try:
-        if hasattr(message, "content") and len(message.content) > 0:
-            message_content = message.content[0]
-            if hasattr(message_content, "text"):
-                nested_text = message_content.text
-                if hasattr(nested_text, "value"):
-                    return nested_text.value
-                return str(nested_text)
-            return str(message_content)
-        return "No se pudo procesar el mensaje"
-    except Exception as e:
-        logging.error(f"Error procesando mensaje: {str(e)}")
-        # Intento de recuperación con estructura alternativa
-        try:
-            # Intento con estructura alternativa
-            if isinstance(message.content, list) and len(message.content) > 0:
-                content_item = message.content[0]
-                if hasattr(content_item, "text") and hasattr(content_item.text, "value"):
-                    return content_item.text.value
-                elif hasattr(content_item, "text"):
-                    return str(content_item.text)
-                elif isinstance(content_item, dict) and "text" in content_item:
-                    if isinstance(content_item["text"], dict) and "value" in content_item["text"]:
-                        return content_item["text"]["value"]
-                    return str(content_item["text"])
-            # Si llegamos hasta aquí, intentamos convertir todo el contenido a string
-            return str(message.content)
-        except:
-            return "Ocurrió un error al procesar el mensaje. Por favor, intenta de nuevo."
-
-
-def check_app_readiness():
-    """Verifica si la aplicación está lista para funcionar"""
-    # Lista de verificaciones críticas
-    ready = True
-    errors = []
-    warnings = []
-
-    # Verificaciones críticas (bloquean el funcionamiento)
-    if not st.session_state.get("openai_api_key"):
-        ready = False
-        errors.append("Falta configurar la clave API de OpenAI")
-
-    if not st.session_state.get("assistant_id"):
-        ready = False
-        errors.append("Falta configurar el ID del Asistente")
-
-    if not st.session_state.get("thread_id"):
-        ready = False
-        errors.append("Error al inicializar el hilo de conversación")
-    
-    # Verificar si el cliente OpenAI se puede crear correctamente
-    if st.session_state.get("openai_api_key") and "openai_client_error" in st.session_state:
-        # Hay un error conocido al crear el cliente
-        ready = False
-        errors.append(f"Error al crear cliente OpenAI: {st.session_state.openai_client_error}")
-
-    # Verificaciones no críticas (advertencias)
-    if not LOTTIE_AVAILABLE:
-        warnings.append("Componente Lottie no disponible (interfaz básica)")
-
-    if not OPTION_MENU_AVAILABLE:
-        warnings.append("Menú de opciones no disponible (usando alternativa)")
-    
-    if not OPENAI_AVAILABLE:
-        errors.append("Biblioteca OpenAI no disponible. Instala con: pip install openai")
-
-    return ready, errors, warnings
-
-
-def show_diagnostic_panel():
-    """Panel de diagnóstico técnico para la aplicación"""
-    with st.expander("🔍 Diagnóstico del Sistema", expanded=False):
-        st.markdown("### Estado de Componentes")
-
-        # Verificar componentes opcionales
-        components = {
-            "streamlit-lottie": LOTTIE_AVAILABLE,
-            "streamlit-option-menu": OPTION_MENU_AVAILABLE,
-            "OpenAI API": bool(st.session_state.get("openai_api_key")),
-            "Assistant ID": bool(st.session_state.get("assistant_id")),
-            "Thread ID": bool(st.session_state.get("thread_id")),
-            "Modelo": st.session_state.get("openai_model", "No configurado"),
-        }
-
-        # Mostrar tabla de componentes
-        components_df = pd.DataFrame(
-            {
-                "Componente": list(components.keys()),
-                "Estado": [
-                    (
-                        "✅ Disponible"
-                        if v is True
-                        else "❌ No disponible" if v is False else v
-                    )
-                    for v in components.values()
-                ],
-            }
-        )
-        st.table(components_df)
-
-        # Verificar conectividad a servicios externos
-        st.markdown("### Pruebas de Conectividad")
-        if st.button("Ejecutar pruebas de conectividad", key="run_connectivity"):
-            with st.spinner("Ejecutando pruebas..."):
-                services = {
-                    "OpenAI API": test_openai_connection(),
-                    "LottieFiles": test_lottiefiles_connection(),
-                }
-
-                services_df = pd.DataFrame(
-                    {
-                        "Servicio": list(services.keys()),
-                        "Estado": [v[0] for v in services.values()],
-                        "Detalle": [v[1] for v in services.values()],
-                    }
-                )
-                st.table(services_df)
-
-        # Información de sesión
-        st.markdown("### Información de Sesión")
-        if st.button("Mostrar detalles de sesión", key="show_session"):
-            # Filtrar información sensible
-            safe_session = {
-                k: (
-                    v
-                    if k not in ["openai_api_key", "assistant_id"]
-                    else f"{str(v)[:5]}..."
-                )
-                for k, v in st.session_state.items()
-            }
-            st.json(safe_session)
-
-        # Información de entorno
-        st.markdown("### Información del Entorno de Ejecución")
-        environment = detect_environment()
-        env_info = {
-            "Python Version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-            "Streamlit Version": st.__version__,
-            "OpenAI Package": getattr(OpenAI, "__version__", "Desconocida") if OPENAI_AVAILABLE else "No disponible",
-            "Entorno Detectado": environment,
-            "Tema": (
-                "Oscuro" if st.config.get_option("theme.base") == "dark" else "Claro"
-            ),
-        }
-
-        env_df = pd.DataFrame(
-            {"Parámetro": list(env_info.keys()), "Valor": list(env_info.values())}
-        )
-        st.table(env_df)
-        
-        # Sección de depuración avanzada
-        st.markdown("### Depuración Avanzada")
-        
-        # Mostrar información de diagnóstico OpenAI
-        if st.button("Mostrar Información de Diagnóstico API", key="api_diag"):
-            try:
-                import inspect
-                
-                # Mostrar información sobre el constructor de OpenAI
-                if OPENAI_AVAILABLE:
-                    st.code(inspect.signature(OpenAI.__init__))
-                else:
-                    st.error("OpenAI no está disponible para diagnóstico")
-                
-                # Verificar si hay variables de entorno HTTP_PROXY o HTTPS_PROXY
-                proxy_settings = get_proxy_settings()
-                
-                if proxy_settings:
-                    st.warning("⚠️ Se detectaron variables de entorno de proxy que podrían causar problemas:")
-                    st.json(proxy_settings)
-                else:
-                    st.success("✅ No se detectaron variables de entorno de proxy.")
-            except Exception as e:
-                st.error(f"Error al obtener información de depuración: {str(e)}")
-        
-        # Herramientas avanzadas de diagnóstico
-        st.markdown("### Herramientas de Diagnóstico Avanzado")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("Diagnóstico del Sistema", key="system_diag"):
-                system_info = get_system_info()
-                st.json(system_info)
-        
-        with col2:
-            if st.button("Limpieza de Caché", key="clear_cache"):
-                # Limpieza de caché para resolución de problemas
-                st.cache_data.clear()
-                st.cache_resource.clear()
-                if "thread_id" in st.session_state and st.session_state["thread_id"] is not None:
-                    # Mantener thread_id para no perder la conversación
-                    thread_id = st.session_state["thread_id"]
-                    st.session_state.clear()
-                    st.session_state["thread_id"] = thread_id
-                    st.success("Caché limpiada manteniendo la conversación actual")
-                else:
-                    st.session_state.clear()
-                    st.success("Caché y estado de sesión completamente limpiados")
-                    st.info("Recarga la página para reiniciar la aplicación")
-
-        # Mostrar indicadores de entorno detallados
-        st.markdown("### Indicadores de Entorno")
-        
-        # Recopilar todos los indicadores relevantes
-        streamlit_cloud_indicators = [
-            ("STREAMLIT_SHARING_MODE", os.environ.get("STREAMLIT_SHARING_MODE")),
-            ("STREAMLIT_SERVER_BASE_URL_IS_SET", os.environ.get("STREAMLIT_SERVER_BASE_URL_IS_SET")),
-            ("IS_STREAMLIT_CLOUD", os.environ.get("IS_STREAMLIT_CLOUD")),
-            ("Config Streamlit existe", os.path.exists("/.streamlit/config.toml")),
-            ("HOSTNAME", os.environ.get("HOSTNAME", "")),
-            ("Config local existe", os.path.exists(os.path.join(os.path.expanduser("~"), ".streamlit"))),
+        # Múltiples indicadores para una detección más robusta
+        indicators = [
+            os.environ.get("STREAMLIT_SHARING_MODE") is not None,
+            os.environ.get("STREAMLIT_SERVER_BASE_URL_IS_SET") is not None,
+            os.environ.get("IS_STREAMLIT_CLOUD") == "true",
+            os.path.exists("/.streamlit/config.toml"),
+            "STREAMLIT_RUNTIME" in os.environ
         ]
         
-        # Mostrar indicadores
-        indicators_df = pd.DataFrame(
-            {"Indicador": [i[0] for i in streamlit_cloud_indicators], 
-             "Valor": [str(i[1]) for i in streamlit_cloud_indicators]}
-        )
-        st.table(indicators_df)
+        # Si al menos dos indicadores son positivos, consideramos que es Cloud
+        return sum(indicators) >= 2
+    except Exception as e:
+        logging.warning(f"Error al detectar entorno: {str(e)}")
+        return False
 
-        # Sección de reinicio forzado
-        st.markdown("### Reinicio de Emergencia")
-        if st.button("Reinicio Completo", key="force_restart"):
-            # Intento de reinicio completo
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.experimental_rerun()
-
-
-def show_environment_diagnostic():
-    """Panel de diagnóstico especializado para problemas de entorno"""
-    with st.expander("🔍 Diagnóstico de Entorno", expanded=False):
-        st.markdown("### Indicadores de Entorno")
+# Crear cliente OpenAI para Assistants
+@handle_error(max_retries=1)
+def create_openai_client(api_key):
+    """
+    Crea un cliente OpenAI con encabezados compatibles con Assistants API v2
+    y verificación de conectividad
+    """
+    try:
+        client = OpenAI(api_key=api_key, default_headers={"OpenAI-Beta": "assistants=v2"})
         
-        # Recopilar todos los indicadores relevantes
-        env_indicators = {
-            "STREAMLIT_SHARING_MODE": os.environ.get("STREAMLIT_SHARING_MODE"),
-            "STREAMLIT_SERVER_BASE_URL_IS_SET": os.environ.get("STREAMLIT_SERVER_BASE_URL_IS_SET"),
-            "IS_STREAMLIT_CLOUD": os.environ.get("IS_STREAMLIT_CLOUD"),
-            "Config Streamlit existe": os.path.exists("/.streamlit/config.toml"),
-            "HOSTNAME": os.environ.get("HOSTNAME", "")
+        # Verificar conectividad con una llamada simple
+        models = client.models.list()
+        if not models:
+            raise Exception("No se pudo obtener la lista de modelos")
+            
+        logging.info("Cliente OpenAI inicializado correctamente")
+        return client
+    except Exception as e:
+        logging.error(f"Error inicializando cliente OpenAI: {str(e)}")
+        st.error(f"No se pudo conectar a OpenAI: {str(e)}")
+        return None
+
+# Sistema multicapa para exportación de conversaciones
+def export_chat_to_pdf(messages):
+    """
+    Sistema multicapa para exportación de conversaciones a PDF.
+    Implementa múltiples estrategias de generación con manejo de fallos.
+    """
+    try:
+        # Método 1 (preferido): FPDF con manejo mejorado
+        return _export_chat_to_pdf_primary(messages)
+    except Exception as e:
+        logging.warning(f"Método primario de exportación a PDF falló: {str(e)}")
+        try:
+            # Método 2: ReportLab como alternativa
+            return _export_chat_to_pdf_secondary(messages)
+        except Exception as e2:
+            logging.warning(f"Método secundario de exportación a PDF falló: {str(e2)}")
+            try:
+                # Método 3: Conversión simple como último recurso
+                return _export_chat_to_pdf_fallback(messages)
+            except Exception as e3:
+                logging.error(f"Todos los métodos de exportación a PDF fallaron: {str(e3)}")
+                # Último recurso: Devolver contenido en markdown codificado
+                md_content = export_chat_to_markdown(messages)
+                st.warning("No fue posible generar un PDF. Se ha creado un archivo markdown en su lugar.")
+                return base64.b64encode(md_content.encode()).decode(), "markdown"
+
+def _export_chat_to_pdf_primary(messages):
+    """
+    Método primario: FPDF optimizado con manejo de errores mejorado
+    y división inteligente de texto para evitar problemas de espacio
+    """
+    from fpdf import FPDF
+    import re
+    
+    class CustomPDF(FPDF):
+        def header(self):
+            self.set_font('helvetica', 'B', 12)
+            self.cell(0, 10, 'ConsentLex - Historial de Conversación', 0, new_y="NEXT", align='C')
+            self.ln(5)
+            
+        def footer(self):
+            self.set_y(-15)
+            self.set_font('helvetica', 'I', 8)
+            self.cell(0, 10, f'Página {self.page_no()}', 0, 0, 'C')
+            
+        def add_message(self, role, content):
+            # Añadir título del mensaje
+            self.set_font('helvetica', 'B', 11)
+            self.cell(0, 10, role, 0, new_y="NEXT", align='L')
+            self.ln(2)
+            
+            # Añadir contenido con procesamiento seguro
+            self.set_font('helvetica', '', 10)
+            self._safe_add_content(content)
+            self.ln(5)
+            
+        def _safe_add_content(self, content):
+            # Procesar markdown básico
+            content = self._process_markdown(content)
+            
+            # Dividir en párrafos
+            paragraphs = content.split('\n\n')
+            
+            for paragraph in paragraphs:
+                if not paragraph.strip():
+                    self.ln(5)
+                    continue
+                
+                # Dividir párrafos largos en líneas seguras
+                lines = self._safe_wrap_text(paragraph, max_width=180)
+                
+                for line in lines:
+                    if not line.strip():
+                        continue
+                        
+                    if line.startswith('- ') or line.startswith('* '):
+                        # Elemento de lista
+                        self.cell(5, 10, '', 0, 0)
+                        self.cell(5, 10, '•', 0, 0)
+                        self._safe_multi_cell(0, 10, line[2:])
+                    else:
+                        # Párrafo normal
+                        self._safe_multi_cell(0, 10, line)
+                        
+                # Espacio entre párrafos
+                self.ln(2)
+                
+        def _process_markdown(self, text):
+            # Simplificar encabezados
+            text = re.sub(r'^#{1,6}\s+(.*?)$', r'\1', text, flags=re.MULTILINE)
+            
+            # Eliminar elementos multimedia
+            text = re.sub(r'!\[.*?\]\(.*?\)', '[IMAGEN]', text)
+            
+            # Simplificar enlaces
+            text = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', text)
+            
+            return text
+            
+        def _safe_wrap_text(self, text, max_width=180):
+            """Divide texto en líneas seguras para renderizar"""
+            lines = []
+            for raw_line in text.split('\n'):
+                if len(raw_line) < max_width:
+                    lines.append(raw_line)
+                    continue
+                    
+                # Dividir líneas largas en palabras
+                words = raw_line.split(' ')
+                current_line = ""
+                
+                for word in words:
+                    test_line = current_line + " " + word if current_line else word
+                    
+                    if len(test_line) <= max_width:
+                        current_line = test_line
+                    else:
+                        lines.append(current_line)
+                        current_line = word
+                        
+                if current_line:
+                    lines.append(current_line)
+                    
+            return lines
+            
+        def _safe_multi_cell(self, w, h, txt, border=0, align='J', fill=False):
+            """Versión segura de multi_cell con manejo de errores integrado"""
+            try:
+                # Eliminar caracteres no ASCII si es necesario
+                if not all(ord(c) < 128 for c in txt):
+                    txt = ''.join(c if ord(c) < 128 else '?' for c in txt)
+                    
+                # Limitar longitud de línea si es necesario
+                if len(txt) > 200:
+                    chunks = [txt[i:i+200] for i in range(0, len(txt), 200)]
+                    for chunk in chunks:
+                        self.multi_cell(w, h, chunk, border, align, fill)
+                else:
+                    self.multi_cell(w, h, txt, border, align, fill)
+            except Exception as e:
+                logging.warning(f"Error en multi_cell: {str(e)}. Intentando versión simplificada.")
+                # Versión de respaldo extremadamente simplificada
+                safe_txt = ''.join(c for c in txt if c.isalnum() or c in ' .,;:-?!()')
+                self.multi_cell(w, h, safe_txt[:100] + "...", border, align, fill)
+    
+    # Crear el PDF
+    pdf = CustomPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    
+    # Añadir fecha
+    pdf.set_font("helvetica", 'I', 10)
+    pdf.cell(0, 10, f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 0, new_y="NEXT")
+    pdf.ln(5)
+    
+    # Añadir mensajes
+    for msg in messages:
+        role = "Usuario" if msg["role"] == "user" else "ConsentLex"
+        pdf.add_message(role, msg['content'])
+    
+    # Generar PDF
+    output = io.BytesIO()
+    pdf.output(output)
+    return output.getvalue(), "pdf"
+
+def _export_chat_to_pdf_secondary(messages):
+    """
+    Método secundario: ReportLab para generación alternativa de PDF
+    con manejo mejorado de texto extenso
+    """
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    
+    # Crear buffer y documento
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, 
+                          rightMargin=72, leftMargin=72,
+                          topMargin=72, bottomMargin=72)
+    
+    # Configurar estilos
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name='Title', 
+                             fontName='Helvetica-Bold',
+                             fontSize=14,
+                             alignment=1,
+                             spaceAfter=12))
+    styles.add(ParagraphStyle(name='User', 
+                             fontName='Helvetica-Bold',
+                             fontSize=12,
+                             textColor=colors.blue,
+                             spaceAfter=6))
+    styles.add(ParagraphStyle(name='Assistant', 
+                             fontName='Helvetica-Bold',
+                             fontSize=12,
+                             textColor=colors.green,
+                             spaceAfter=6))
+    
+    # Elementos del documento
+    elements = []
+    
+    # Título y fecha
+    elements.append(Paragraph("ConsentLex - Historial de Conversación", styles['Title']))
+    elements.append(Spacer(1, 0.25*inch))
+    elements.append(Paragraph(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles["Italic"]))
+    elements.append(Spacer(1, 0.25*inch))
+    
+    # Función de seguridad para procesar texto
+    def safe_process_text(text, max_chunk=2000):
+        # Escapar caracteres especiales HTML
+        text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        
+        # Convertir newlines a <br/>
+        text = text.replace('\n', '<br/>')
+        
+        # Dividir texto muy largo en secciones manejables
+        if len(text) > max_chunk:
+            chunks = []
+            for i in range(0, len(text), max_chunk):
+                chunks.append(text[i:i+max_chunk])
+            return chunks
+        return [text]
+    
+    # Procesar mensajes
+    for msg in messages:
+        role = "Usuario" if msg["role"] == "user" else "ConsentLex"
+        style = styles["User"] if msg["role"] == "user" else styles["Assistant"]
+        
+        # Título del mensaje
+        elements.append(Paragraph(role, style))
+        
+        # Contenido procesado en porciones seguras
+        content_chunks = safe_process_text(msg['content'])
+        for i, chunk in enumerate(content_chunks):
+            try:
+                elements.append(Paragraph(chunk, styles["Normal"]))
+                if i < len(content_chunks) - 1:
+                    elements.append(Spacer(1, 0.1*inch))
+            except Exception as e:
+                logging.warning(f"Error al procesar chunk {i}: {str(e)}")
+                # Versión ultra simplificada como respaldo
+                elements.append(Paragraph("[Contenido simplificado debido a error de formato]", styles["Normal"]))
+        
+        elements.append(Spacer(1, 0.2*inch))
+    
+    # Generar documento con manejo de errores
+    try:
+        doc.build(elements)
+        pdf_data = buffer.getvalue()
+        buffer.close()
+        return pdf_data, "pdf"
+    except Exception as e:
+        logging.error(f"Error en ReportLab: {str(e)}")
+        raise e
+
+def _export_chat_to_pdf_fallback(messages):
+    """
+    Método de último recurso: PDF simple sin formato avanzado
+    diseñado para máxima compatibilidad y robustez
+    """
+    from fpdf import FPDF
+    
+    # PDF básico con manejo mínimo
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("helvetica", size=12)
+    
+    # Título
+    pdf.set_font("helvetica", style='B', size=16)
+    pdf.cell(200, 10, "ConsentLex - Historial de Conversación", ln=True, align='C')
+    pdf.ln(5)
+    
+    # Fecha
+    pdf.set_font("helvetica", style='I', size=10)
+    pdf.cell(200, 10, f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True)
+    pdf.ln(10)
+    
+    # Mensajes - formato mínimo con máxima seguridad
+    pdf.set_font("helvetica", size=11)
+    for msg in messages:
+        role = "Usuario" if msg["role"] == "user" else "ConsentLex"
+        
+        # Encabezado del mensaje
+        pdf.set_font("helvetica", style='B', size=12)
+        pdf.cell(200, 10, role, ln=True)
+        pdf.ln(2)
+        
+        # Contenido ultra-simple, sin formato
+        pdf.set_font("helvetica", size=10)
+        
+        # Extraer texto plano con máxima seguridad
+        simple_text = ''.join(c if ord(c) < 128 else '?' for c in msg['content'])
+        simple_text = simple_text.replace('\n', ' ').replace('\r', '')
+        
+        # Dividir texto en líneas muy cortas para evitar errores
+        line_length = 50  # Longitud muy conservadora
+        for i in range(0, len(simple_text), line_length):
+            chunk = simple_text[i:i+line_length]
+            try:
+                pdf.cell(0, 10, chunk, ln=True)
+            except:
+                # Si falla incluso con texto simplificado, usar solo alfanuméricos
+                ultra_safe = ''.join(c for c in chunk if c.isalnum() or c == ' ')
+                try:
+                    pdf.cell(0, 10, ultra_safe, ln=True)
+                except:
+                    # Abandonar este chunk si todo falla
+                    pass
+        
+        pdf.ln(10)
+    
+    # Generar PDF
+    try:
+        output = io.BytesIO()
+        pdf.output(output)
+        return output.getvalue(), "pdf"
+    except Exception as e:
+        logging.error(f"Error incluso en fallback: {str(e)}")
+        raise e
+
+def export_chat_to_markdown(messages):
+    """
+    Exporta el historial de chat a formato markdown
+    con mejoras de formato y legibilidad
+    """
+    md_content = "# ConsentLex - Historial de Conversación\n\n"
+    md_content += f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    
+    for msg in messages:
+        role = "Usuario" if msg["role"] == "user" else "ConsentLex"
+        md_content += f"## {role}\n\n{msg['content']}\n\n"
+        md_content += "---\n\n"  # Separador para mejorar legibilidad
+    
+    return md_content
+
+# Funciones de OCR con Mistral
+@handle_error(max_retries=1)
+def detect_document_type(file):
+    """
+    Detecta automáticamente si un archivo es un PDF o una imagen
+    con múltiples verificaciones para mayor precisión
+    
+    Parámetros:
+        file: Objeto de archivo cargado por el usuario mediante Streamlit
+        
+    Retorno:
+        string: Tipo de documento detectado ("PDF" o "Imagen")
+    """
+    # 1. Verificar por MIME type
+    if hasattr(file, "type"):
+        mime_type = file.type
+        if mime_type.startswith("application/pdf"):
+            return "PDF"
+        elif mime_type.startswith("image/"):
+            return "Imagen"
+
+    # 2. Verificar por extensión del nombre
+    if hasattr(file, "name"):
+        name = file.name.lower()
+        if name.endswith(".pdf"):
+            return "PDF"
+        elif name.endswith((".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp")):
+            return "Imagen"
+
+    # 3. Verificar contenido con análisis de bytes
+    try:
+        # Guardar posición del cursor
+        position = file.tell()
+        # Leer los primeros bytes
+        header = file.read(8)
+        file.seek(position)  # Restaurar posición
+        
+        # Verificar firmas de archivo comunes
+        if header.startswith(b'%PDF'):
+            return "PDF"
+        elif header.startswith(b'\x89PNG') or header.startswith(b'\xff\xd8'):
+            return "Imagen"
+    except:
+        pass
+        
+    # 4. Intentar abrir como imagen (último recurso)
+    try:
+        Image.open(file)
+        file.seek(0)  # Restaurar el puntero
+        return "Imagen"
+    except:
+        file.seek(0)  # Restaurar el puntero
+        
+    # Asumir PDF por defecto
+    return "PDF"
+
+@handle_error(max_retries=1)
+def prepare_image_for_ocr(file_data):
+    """
+    Prepara una imagen para ser procesada con OCR,
+    optimizando formato y calidad para mejorar resultados
+    
+    Parámetros:
+        file_data: Datos binarios de la imagen
+        
+    Retorno:
+        tuple: (datos_optimizados, mime_type)
+    """
+    try:
+        # Abrir la imagen con PIL
+        img = Image.open(BytesIO(file_data))
+
+        # Optimizaciones avanzadas para OCR
+        # 1. Convertir a escala de grises si tiene más de un canal
+        if img.mode != 'L' and img.mode != '1':
+            img = img.convert('L')
+            
+        # 2. Ajustar tamaño si es muy grande (límite 4000px)
+        max_dimension = 4000
+        if img.width > max_dimension or img.height > max_dimension:
+            ratio = min(max_dimension / img.width, max_dimension / img.height)
+            new_width = int(img.width * ratio)
+            new_height = int(img.height * ratio)
+            img = img.resize((new_width, new_height), Image.LANCZOS)
+            
+        # 3. Evaluar y determinar mejor formato
+        # JPEG para imágenes fotográficas, PNG para documentos/texto
+        save_format = "JPEG"
+        save_quality = 95
+        
+        # Detectar si es más probable que sea un documento (blanco/negro predominante)
+        histogram = img.histogram()
+        if img.mode == 'L' and (histogram[0] + histogram[-1]) > sum(histogram) * 0.8:
+            save_format = "PNG"
+            
+        # 4. Guardar con parámetros optimizados
+        buffer = BytesIO()
+        if save_format == "JPEG":
+            img.save(buffer, format=save_format, quality=save_quality, optimize=True)
+        else:
+            img.save(buffer, format=save_format, optimize=True)
+
+        buffer.seek(0)
+        return buffer.read(), f"image/{save_format.lower()}"
+
+    except Exception as e:
+        logging.warning(f"Optimización de imagen fallida: {str(e)}")
+        return file_data, "image/jpeg"  # Formato por defecto
+
+@handle_error(max_retries=1)
+def extract_text_from_ocr_response(response):
+    """
+    Extrae texto de diferentes formatos de respuesta OCR
+    con soporte para múltiples estructuras de datos
+    
+    Parámetros:
+        response: Respuesta JSON del servicio OCR
+        
+    Retorno:
+        dict: Diccionario con el texto extraído
+    """
+    # Registro para diagnóstico
+    logging.info(f"Procesando respuesta OCR de tipo: {type(response)}")
+    
+    # Caso 1: Si hay páginas con markdown (formato preferido)
+    if "pages" in response and isinstance(response["pages"], list):
+        pages = response["pages"]
+        if pages and "markdown" in pages[0]:
+            markdown_text = "\n\n".join(page.get("markdown", "") for page in pages)
+            if markdown_text.strip():
+                return {"text": markdown_text, "format": "markdown"}
+
+    # Caso 2: Si hay un texto plano en la respuesta
+    if "text" in response:
+        return {"text": response["text"], "format": "text"}
+
+    # Caso 3: Si hay elementos estructurados
+    if "elements" in response:
+        elements = response["elements"]
+        if isinstance(elements, list):
+            text_parts = []
+            for element in elements:
+                if "text" in element:
+                    text_parts.append(element["text"])
+            return {"text": "\n".join(text_parts), "format": "elements"}
+
+    # Caso 4: Si hay un campo 'content' principal
+    if "content" in response:
+        return {"text": response["content"], "format": "content"}
+
+    # Caso 5: Extracción recursiva de todos los campos de texto
+    try:
+        response_str = json.dumps(response, indent=2)
+        # Si la respuesta es muy grande, limitar extracción
+        if len(response_str) > 10000:
+            response_str = response_str[:10000] + "... [truncado]"
+            
+        extracted_text = extract_all_text_fields(response)
+        if extracted_text:
+            return {"text": extracted_text, "format": "extracted"}
+
+        return {
+            "text": "No se pudo encontrar texto estructurado en la respuesta OCR. Vea los detalles técnicos.",
+            "format": "unknown",
+            "raw_response": response_str,
+        }
+    except Exception as e:
+        logging.error(f"Error al procesar respuesta OCR: {str(e)}")
+        return {"error": f"Error al procesar la respuesta: {str(e)}"}
+
+@handle_error(max_retries=0)
+def extract_all_text_fields(data, prefix="", max_depth=5, current_depth=0):
+    """
+    Función recursiva optimizada para extraer todos los campos de texto 
+    de un diccionario anidado con límites de profundidad
+    
+    Parámetros:
+        data: Diccionario o lista de datos
+        prefix: Prefijo para la ruta de acceso (uso recursivo)
+        max_depth: Profundidad máxima de recursión
+        current_depth: Profundidad actual (uso recursivo)
+        
+    Retorno:
+        string: Texto extraído
+    """
+    # Evitar recursión infinita
+    if current_depth > max_depth:
+        return []
+    
+    result = []
+
+    if isinstance(data, dict):
+        for key, value in data.items():
+            new_prefix = f"{prefix}.{key}" if prefix else key
+
+            if isinstance(value, str) and len(value) > 1:
+                result.append(f"{new_prefix}: {value}")
+            elif isinstance(value, (dict, list)) and value:  # Solo recursión si hay contenido
+                child_results = extract_all_text_fields(
+                    value, new_prefix, max_depth, current_depth + 1
+                )
+                result.extend(child_results)
+
+    elif isinstance(data, list):
+        # Limitar número de elementos procesados en listas muy grandes
+        max_items = 20
+        for i, item in enumerate(data[:max_items]):
+            new_prefix = f"{prefix}[{i}]"
+            if isinstance(item, (dict, list)) and item:
+                child_results = extract_all_text_fields(
+                    item, new_prefix, max_depth, current_depth + 1
+                )
+                result.extend(child_results)
+            elif isinstance(item, str) and len(item) > 1:
+                result.append(f"{new_prefix}: {item}")
+        
+        # Indicar si se truncó la lista
+        if len(data) > max_items:
+            result.append(f"{prefix}: [... {len(data) - max_items} elementos adicionales omitidos]")
+
+    return "\n".join(result)
+
+@handle_error(max_retries=1)
+def process_document_with_mistral_ocr(api_key, file_bytes, file_type, file_name):
+    """
+    Procesa un documento con OCR de Mistral
+    con sistema de recuperación ante fallos
+    
+    Parámetros:
+        api_key: API key de Mistral
+        file_bytes: Bytes del archivo
+        file_type: Tipo de archivo ("PDF" o "Imagen")
+        file_name: Nombre del archivo
+        
+    Retorno:
+        dict: Texto extraído del documento
+    """
+    job_id = str(uuid.uuid4())
+    logging.info(f"Procesando documento {file_name} con Mistral OCR (ID: {job_id})")
+    
+    # Mostrar estado
+    with st.status(f"Procesando documento {file_name}...", expanded=True) as status:
+        try:
+            status.update(label="Preparando documento para OCR...", state="running")
+            
+            # Guardar una copia del archivo para depuración
+            debug_dir = os.path.join(tempfile.gettempdir(), "consentlex_debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file_path = os.path.join(debug_dir, f"debug_{job_id}_{file_name}")
+            
+            with open(debug_file_path, "wb") as f:
+                f.write(file_bytes)
+            
+            logging.info(f"Archivo de depuración guardado en: {debug_file_path}")
+            
+            # Sistema de procesamiento con verificación según tipo
+            if file_type == "PDF":
+                # Verificar que el PDF sea válido
+                try:
+                    import PyPDF2
+                    reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+                    page_count = len(reader.pages)
+                    sample_text = ""
+                    if page_count > 0:
+                        sample_text = reader.pages[0].extract_text()[:100]
+                    logging.info(f"PDF válido con {page_count} páginas. Muestra: {sample_text}")
+                    
+                    # Codificar PDF en base64
+                    encoded_file = base64.b64encode(file_bytes).decode("utf-8")
+                    document = {
+                        "type": "document_url",
+                        "document_url": f"data:application/pdf;base64,{encoded_file}"
+                    }
+                except Exception as e:
+                    logging.error(f"Error al validar PDF: {str(e)}")
+                    status.update(label=f"Error al validar PDF: {str(e)}", state="error")
+                    
+                    # Intentar procesar como imagen si el PDF falló
+                    logging.info("Intentando procesar como imagen alternativa...")
+                    try:
+                        optimized_bytes, mime_type = prepare_image_for_ocr(file_bytes)
+                        encoded_file = base64.b64encode(optimized_bytes).decode("utf-8")
+                        document = {
+                            "type": "image_url",
+                            "image_url": f"data:{mime_type};base64,{encoded_file}"
+                        }
+                    except Exception as e2:
+                        return {"error": f"El archivo no es un PDF válido ni una imagen: {str(e2)}"}
+            else:  # Imagen
+                # Optimizar imagen para mejores resultados
+                optimized_bytes, mime_type = prepare_image_for_ocr(file_bytes)
+                
+                # Codificar en base64
+                encoded_file = base64.b64encode(optimized_bytes).decode("utf-8")
+                document = {
+                    "type": "image_url",
+                    "image_url": f"data:{mime_type};base64,{encoded_file}"
+                }
+            
+            status.update(label="Enviando documento a la API de Mistral...", state="running")
+            
+            # Configurar los headers
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            }
+            
+            # Preparar payload
+            payload = {
+                "model": "mistral-ocr-latest",
+                "document": document
+            }
+            
+            # Guardar payload para depuración (excluyendo contenido base64 por tamaño)
+            debug_payload = {
+                "model": payload["model"],
+                "document": {
+                    "type": payload["document"]["type"],
+                    "content_size": len(encoded_file),
+                    "content_format": "base64"
+                }
+            }
+            logging.info(f"Payload para OCR: {json.dumps(debug_payload)}")
+            
+            # Sistema de retry interno para la API de Mistral
+            max_retries = 2
+            retry_delay = 2
+            last_error = None
+            
+            for retry in range(max_retries + 1):
+                try:
+                    # Hacer la solicitud a Mistral OCR API
+                    response = requests.post(
+                        "https://api.mistral.ai/v1/ocr",
+                        json=payload,
+                        headers=headers,
+                        timeout=90  # Timeout ampliado para documentos grandes
+                    )
+                    
+                    logging.info(f"Respuesta de OCR API - Estado: {response.status_code}")
+                    
+                    if response.status_code == 200:
+                        try:
+                            result = response.json()
+                            # Guardar respuesta para depuración
+                            with open(os.path.join(debug_dir, f"response_{job_id}_{file_name}.json"), "w") as f:
+                                json.dump(result, f, indent=2)
+                                
+                            status.update(label=f"Documento {file_name} procesado exitosamente", state="complete")
+                            
+                            # Verificar existencia de contenido
+                            if not result or (isinstance(result, dict) and not result):
+                                return {"error": "La API no devolvió contenido", "raw_response": str(result)}
+                            
+                            # Extraer texto de la respuesta
+                            extracted_content = extract_text_from_ocr_response(result)
+                            
+                            if "error" in extracted_content:
+                                status.update(label=f"Error al extraer texto: {extracted_content['error']}", state="error")
+                                return {"error": extracted_content['error'], "raw_response": result}
+                            
+                            return extracted_content
+                        except Exception as e:
+                            error_message = f"Error al procesar respuesta JSON: {str(e)}"
+                            logging.error(error_message)
+                            # Guardar respuesta cruda para depuración
+                            with open(os.path.join(debug_dir, f"raw_response_{job_id}_{file_name}.txt"), "w") as f:
+                                f.write(response.text[:10000])  # Limitar tamaño
+                            status.update(label=error_message, state="error")
+                            last_error = e
+                    elif response.status_code == 429:  # Rate limit
+                        if retry < max_retries:
+                            wait_time = retry_delay * (retry + 1)
+                            logging.warning(f"Rate limit alcanzado. Esperando {wait_time}s antes de reintentar...")
+                            status.update(label=f"Límite de tasa alcanzado. Reintentando en {wait_time}s...", state="running")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            error_message = "Límite de tasa alcanzado. No se pudo procesar después de reintentos."
+                            logging.error(error_message)
+                            status.update(label=error_message, state="error")
+                            return {"error": error_message, "raw_response": response.text}
+                    else:
+                        error_message = f"Error en API OCR ({response.status_code}): {response.text[:500]}"
+                        logging.error(error_message)
+                        status.update(label=f"Error: {error_message}", state="error")
+                        last_error = Exception(error_message)
+                        break
+                except requests.exceptions.Timeout:
+                    if retry < max_retries:
+                        wait_time = retry_delay * (retry + 1)
+                        logging.warning(f"Timeout al contactar API. Esperando {wait_time}s antes de reintentar...")
+                        status.update(label=f"Timeout. Reintentando en {wait_time}s...", state="running")
+                        time.sleep(wait_time)
+                    else:
+                        error_message = "Timeout al contactar API después de múltiples intentos."
+                        logging.error(error_message)
+                        status.update(label=error_message, state="error")
+                        return {"error": error_message}
+                except Exception as e:
+                    if retry < max_retries:
+                        wait_time = retry_delay * (retry + 1)
+                        logging.warning(f"Error: {str(e)}. Esperando {wait_time}s antes de reintentar...")
+                        status.update(label=f"Error. Reintentando en {wait_time}s...", state="running")
+                        time.sleep(wait_time)
+                    else:
+                        error_message = f"Error al procesar documento: {str(e)}"
+                        logging.error(error_message)
+                        status.update(label=f"Error: {error_message}", state="error")
+                        last_error = e
+                        break
+            
+            # Si llegamos aquí después de reintentos, devolver último error
+            return {"error": f"Error después de reintentos: {str(last_error)}", "details": traceback.format_exc()}
+                
+        except Exception as e:
+            error_message = f"Error general al procesar documento: {str(e)}"
+            logging.error(error_message)
+            logging.error(traceback.format_exc())
+            status.update(label=f"Error: {error_message}", state="error")
+            return {"error": error_message}
+
+# Función segura para gestionar el contexto de documentos
+@handle_error(max_retries=0)
+def manage_document_context():
+    """
+    Permite al usuario gestionar qué documentos mantener en el contexto actual
+    con manejo seguro de actualización de estado
+    """
+    if "document_contents" in st.session_state and st.session_state.document_contents:
+        st.write("Documentos en contexto actual:")
+        
+        # Crear checkboxes para cada documento
+        docs_to_keep = {}
+        for doc_name in st.session_state.document_contents:
+            docs_to_keep[doc_name] = st.checkbox(f"{doc_name}", value=True, key=f"keep_{doc_name}")
+        
+        # Botón para aplicar cambios
+        if st.button("Actualizar contexto", key="update_context"):
+            # Eliminar documentos no seleccionados
+            docs_to_remove = [doc for doc, keep in docs_to_keep.items() if not keep]
+            if docs_to_remove:
+                for doc in docs_to_remove:
+                    if doc in st.session_state.document_contents:
+                        del st.session_state.document_contents[doc]
+                    if doc in st.session_state.uploaded_files:
+                        st.session_state.uploaded_files.remove(doc)
+                
+                st.success(f"Se eliminaron {len(docs_to_remove)} documentos del contexto.")
+                # Usar sistema seguro de reinicio
+                rerun_app()
+            else:
+                st.info("No se seleccionaron documentos para eliminar.")
+    else:
+        st.info("No hay documentos cargados en el contexto actual.")
+
+# Función para inicializar un thread con OpenAI Assistants
+@handle_error(max_retries=1)
+def initialize_thread(client):
+    """
+    Inicializa un nuevo thread de conversación
+    con verificación de éxito
+    """
+    try:
+        thread = client.beta.threads.create()
+        thread_id = thread.id
+        logging.info(f"Thread creado: {thread_id}")
+        
+        # Verificar que el thread se creó correctamente
+        test_thread = client.beta.threads.retrieve(thread_id=thread_id)
+        if not test_thread or not hasattr(test_thread, "id"):
+            raise Exception("El thread se creó pero no se puede recuperar")
+            
+        return thread_id
+    except Exception as e:
+        logging.error(f"Error creando thread: {str(e)}")
+        st.error("No se pudo inicializar la conversación con el asistente")
+        return None
+
+# Función para procesar mensajes del asistente
+@handle_error(max_retries=1)
+def process_message_with_citations(message):
+    """
+    Extrae y formatea el texto del mensaje del asistente con citas adecuadas,
+    manejando diferentes formatos de respuesta
+    """
+    try:
+        # Verificar que el mensaje tenga contenido
+        if not hasattr(message, "content") or not message.content:
+            return "No se pudo procesar el mensaje"
+        
+        # Procesar cada parte del contenido
+        processed_content = ""
+        for content_item in message.content:
+            # Verificar tipo de contenido
+            if hasattr(content_item, "text") and content_item.text:
+                # Procesar texto con anotaciones si existen
+                text_value = content_item.text.value
+                annotations = []
+                
+                # Extraer anotaciones si existen
+                if hasattr(content_item.text, "annotations") and content_item.text.annotations:
+                    annotations = content_item.text.annotations
+                    
+                    # Procesar cada anotación para formatear citas de archivos
+                    if annotations:
+                        # Recolectar información de citas
+                        citations = []
+                        for idx, annotation in enumerate(annotations):
+                            # Reemplazar el texto de la anotación con un marcador de referencia
+                            text_value = text_value.replace(
+                                annotation.text, 
+                                f"[{idx+1}]"
+                            )
+                            
+                            # Extraer detalles de la cita si es una cita de archivo
+                            if file_citation := getattr(annotation, "file_citation", None):
+                                file_id = file_citation.file_id
+                                # Buscar el nombre del archivo en los metadatos
+                                file_name = "Documento de referencia"
+                                if "file_metadata" in st.session_state and file_id in st.session_state.file_metadata:
+                                    file_name = st.session_state.file_metadata[file_id]["name"]
+                                
+                                citations.append(f"[{idx+1}] Fuente: {file_name}")
+                        
+                        # Añadir las citas al final del texto procesado si existen
+                        if citations:
+                            text_value += "\n\n--- Referencias: ---\n" + "\n".join(citations)
+                
+                processed_content += text_value
+            else:
+                # Si no es texto, añadimos una representación genérica
+                processed_content += str(content_item)
+                
+        return processed_content
+    except Exception as e:
+        logging.error(f"Error procesando mensaje: {str(e)}")
+        logging.error(traceback.format_exc())
+        return "Error al procesar la respuesta del asistente"
+
+# Función para enviar mensaje a OpenAI con contexto de documentos
+@handle_error(max_retries=1)
+def send_message_with_document_context(client, thread_id, assistant_id, prompt, current_doc_contents=None):
+    """
+    Envía un mensaje al asistente incluyendo el contexto de todos los documentos disponibles
+    con manejo mejorado de errores y reintentos
+    """
+    try:
+        # Construir el mensaje que incluirá el contexto del documento si existe
+        full_prompt = prompt
+        
+        # Combinar documentos actuales con documentos previamente procesados
+        all_doc_contents = {}
+        
+        # Añadir documentos existentes en la sesión
+        if "document_contents" in st.session_state:
+            all_doc_contents.update(st.session_state.document_contents)
+        
+        # Añadir documentos recién procesados, que pueden sobrescribir los anteriores
+        if current_doc_contents and isinstance(current_doc_contents, dict):
+            all_doc_contents.update(current_doc_contents)
+            # Actualizar la sesión con los nuevos documentos
+            if "document_contents" not in st.session_state:
+                st.session_state.document_contents = {}
+            st.session_state.document_contents.update(current_doc_contents)
+        
+        # Si hay contenido de documentos, añadirlo al prompt
+        if all_doc_contents and len(all_doc_contents) > 0:
+            document_context = "\n\n### Contexto de documentos procesados:\n\n"
+            
+            for doc_name, doc_content in all_doc_contents.items():
+                # Extraer el texto del documento procesado por OCR
+                if isinstance(doc_content, dict):
+                    if "text" in doc_content:
+                        # Limitamos el contenido para no exceder el contexto de OpenAI
+                        doc_text = doc_content["text"][:5000] + "..." if len(doc_content["text"]) > 5000 else doc_content["text"]
+                        document_context += f"-- Documento: {doc_name} --\n{doc_text}\n\n"
+                    elif "error" in doc_content and "raw_response" in doc_content:
+                        # Intentar extraer texto de la respuesta cruda si está disponible
+                        raw_response = doc_content["raw_response"]
+                        if isinstance(raw_response, dict) and "text" in raw_response:
+                            doc_text = raw_response["text"][:5000] + "..." if len(raw_response["text"]) > 5000 else raw_response["text"]
+                            document_context += f"-- Documento: {doc_name} --\n{doc_text}\n\n"
+                        else:
+                            document_context += f"-- Documento: {doc_name} -- (Error al extraer texto: {doc_content['error']})\n\n"
+                    else:
+                        document_context += f"-- Documento: {doc_name} -- (No se pudo extraer texto)\n\n"
+                else:
+                    document_context += f"-- Documento: {doc_name} -- (Formato no reconocido)\n\n"
+            
+            # Verificar si hay contenido real antes de añadirlo al prompt
+            if len(document_context) > 60:  # Más que solo el encabezado
+                full_prompt = f"{prompt}\n\n{document_context}"
+                logging.info(f"Prompt enriquecido con contexto de {len(all_doc_contents)} documentos. Tamaño total: {len(full_prompt)} caracteres")
+            else:
+                logging.warning("No se pudo extraer texto útil de los documentos")
+        
+        # Crear mensaje con el prompt completo (con sistema de retry)
+        message = None
+        for attempt in range(2):
+            try:
+                message = client.beta.threads.messages.create(
+                    thread_id=thread_id,
+                    role="user",
+                    content=full_prompt
+                )
+                break
+            except Exception as e:
+                if attempt == 0:
+                    logging.warning(f"Error al crear mensaje (intento 1): {str(e)}. Reintentando...")
+                    time.sleep(2)
+                else:
+                    raise Exception(f"Error al crear mensaje: {str(e)}")
+        
+        if not message:
+            raise Exception("No se pudo crear el mensaje después de reintentos")
+        
+        # Crear la ejecución
+        run = None
+        for attempt in range(2):
+            try:
+                run = client.beta.threads.runs.create(
+                    thread_id=thread_id,
+                    assistant_id=assistant_id
+                )
+                break
+            except Exception as e:
+                if attempt == 0:
+                    logging.warning(f"Error al crear ejecución (intento 1): {str(e)}. Reintentando...")
+                    time.sleep(2)
+                else:
+                    raise Exception(f"Error al crear ejecución: {str(e)}")
+        
+        if not run:
+            raise Exception("No se pudo iniciar la ejecución después de reintentos")
+        
+        # Esperar a que se complete la ejecución
+        with st.status("Analizando consulta y procesando información...", expanded=True) as status:
+            run_counter = 0
+            max_run_time = 120  # Tiempo máximo de espera (2 minutos)
+            start_time = time.time()
+            
+            while run.status not in ["completed", "failed", "cancelled", "expired"]:
+                run_counter += 1
+                time.sleep(1)
+                
+                # Verificar timeout
+                elapsed_time = time.time() - start_time
+                if elapsed_time > max_run_time:
+                    status.update(label="La operación está tomando demasiado tiempo. Intente nuevamente.", state="error")
+                    logging.error(f"Timeout después de {max_run_time}s esperando completar ejecución.")
+                    return None
+                
+                # Actualizar el estado cada 2 segundos para no sobrecargar la API
+                if run_counter % 2 == 0:
+                    try:
+                        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+                    except Exception as e:
+                        logging.warning(f"Error al recuperar estado de ejecución: {str(e)}")
+                        # Continuar intentando, podría ser un error temporal
+                
+                # Mostrar mensajes según el estado
+                if run.status == "in_progress":
+                    status.update(label="Procesando consulta y analizando documentos...", state="running")
+                elif run.status == "requires_action":
+                    status.update(label="Realizando acciones requeridas...", state="running")
+                
+                # Manejar errores
+                if run.status == "failed":
+                    error_msg = f"Error en la ejecución: {getattr(run, 'last_error', 'Desconocido')}"
+                    logging.error(error_msg)
+                    status.update(label="Error en el procesamiento", state="error")
+                    return None
+            
+            # Actualizar estado final
+            if run.status == "completed":
+                status.update(label="Análisis completado", state="complete")
+            else:
+                status.update(label=f"Estado final: {run.status}", state="error")
+        
+        # Recuperar mensajes agregados por el asistente
+        if run.status == "completed":
+            try:
+                messages = client.beta.threads.messages.list(thread_id=thread_id)
+                
+                # Buscar el mensaje más reciente del asistente
+                for message in messages.data:
+                    if message.role == "assistant" and not any(
+                        msg["role"] == "assistant" and msg.get("id") == message.id
+                        for msg in st.session_state.messages
+                    ):
+                        full_response = process_message_with_citations(message)
+                        return {
+                            "role": "assistant",
+                            "content": full_response,
+                            "id": message.id,
+                        }
+                
+                # Si no se encontró un mensaje nuevo
+                logging.warning("No se encontraron nuevos mensajes del asistente")
+                return None
+            except Exception as e:
+                logging.error(f"Error al recuperar mensajes: {str(e)}")
+                return None
+        
+        return None
+    except Exception as e:
+        logging.error(f"Error en comunicación con OpenAI: {str(e)}")
+        logging.error(traceback.format_exc())
+        st.error("Ocurrió un error al comunicarse con el asistente. Por favor, intente nuevamente.")
+        return None
+
+# Función para limpiar la sesión actual
+@handle_error(max_retries=0)
+def clean_current_session():
+    """
+    Limpia todos los recursos de la sesión actual
+    con verificación de resultados
+    """
+    try:
+        resources_cleaned = {
+            "documents": 0,
+            "messages": len(st.session_state.messages) if "messages" in st.session_state else 0
         }
         
-        # Mostrar indicadores
-        indicators_df = pd.DataFrame(
-            {"Indicador": list(env_indicators.keys()), 
-             "Valor": [str(v) for v in env_indicators.values()]}
-        )
-        st.table(indicators_df)
+        # Limpiar documentos procesados
+        if "document_contents" in st.session_state:
+            resources_cleaned["documents"] = len(st.session_state.document_contents)
+            st.session_state.document_contents = {}
         
-        # Intentar mostrar entorno deducido
-        st.markdown(f"**Entorno deducido:** {detect_environment()}")
+        # Limpiar lista de archivos
+        if "uploaded_files" in st.session_state:
+            st.session_state.uploaded_files = []
         
-        # Mostrar información detallada del módulo OpenAI
-        if st.button("Mostrar detalles del módulo OpenAI"):
-            try:
-                import inspect
-                import openai
-                
-                # Información sobre versión
-                st.markdown(f"**Versión del módulo OpenAI:** {openai.__version__}")
-                
-                # Ruta del módulo
-                st.markdown(f"**Ruta del módulo:** {inspect.getfile(openai)}")
-                
-                # Estructura interna
-                st.markdown("**Estructura del módulo OpenAI:**")
-                module_attrs = [attr for attr in dir(openai) if not attr.startswith('_')]
-                st.json(module_attrs)
-                
-                # Implementación específica
-                st.markdown("**Método de creación de cliente:**")
-                try:
-                    st.code(inspect.getsource(openai.OpenAI.__init__))
-                except:
-                    st.warning("No se pudo obtener el código fuente del constructor")
-            except Exception as e:
-                st.error(f"Error al obtener información del módulo: {str(e)}")
+        # Limpiar historial de mensajes
+        if "messages" in st.session_state:
+            st.session_state.messages = []
+        
+        # Limpiar otros estados relacionados con documentos
+        for key in ["file_metadata"]:
+            if key in st.session_state:
+                st.session_state[key] = {}
+        
+        # Verificar limpieza exitosa
+        clean_success = True
+        if "document_contents" in st.session_state and st.session_state.document_contents:
+            clean_success = False
+        if "messages" in st.session_state and st.session_state.messages:
+            clean_success = False
+            
+        if clean_success:
+            logging.info(f"Sesión limpiada exitosamente: {resources_cleaned['documents']} documentos, {resources_cleaned['messages']} mensajes")
+        else:
+            logging.warning("Limpieza de sesión incompleta - algunos elementos persistieron")
+            
+        return resources_cleaned
+    except Exception as e:
+        logging.error(f"Error limpiando sesión: {str(e)}")
+        return {
+            "documents": 0,
+            "messages": 0,
+            "error": str(e)
+        }
 
+# ----- INICIALIZACIÓN DE INTERFAZ -----
 
-@with_error_handling()
-def setup_openai_client():
-    """Configuración robusta del cliente OpenAI compatible con Streamlit Cloud"""
-    # Jerarquía clara de fuentes de configuración
-    api_key = None
+# Título principal
+st.title("ConsentLex ⚖️ Experto en Consentimiento Informado")
+
+# Barra lateral con toda la información e instrucciones
+with st.sidebar:
+    st.title("⚖️ Configuración y Recursos")
+
+    # Obtener API Key de OpenAI
+    openai_api_key = None
+    # 1. Intentar obtener de variables de entorno
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+
+    # 2. Intentar obtener de secrets.toml
+    if not openai_api_key and hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
+        openai_api_key = st.secrets["OPENAI_API_KEY"]
+
+    # 3. Solicitar al usuario
+    if not openai_api_key:
+        openai_api_key = st.text_input("API Key de OpenAI", type="password", help="Ingrese su API Key de OpenAI")
+
+    # Obtener API Key de Mistral 
+    mistral_api_key = None
+    # 1. Intentar obtener de variables de entorno
+    mistral_api_key = os.environ.get("MISTRAL_API_KEY")
+
+    # 2. Intentar obtener de secrets.toml
+    if not mistral_api_key and hasattr(st, "secrets") and "MISTRAL_API_KEY" in st.secrets:
+        mistral_api_key = st.secrets["MISTRAL_API_KEY"]
+
+    # 3. Solicitar al usuario
+    if not mistral_api_key:
+        mistral_api_key = st.text_input("API Key de Mistral", type="password", help="Ingrese su API Key de Mistral para OCR")
+
+    # Obtener Assistant ID
     assistant_id = None
-    model = None
+    # 1. Intentar obtener de variables de entorno
+    assistant_id = os.environ.get("ASSISTANT_ID")
 
-    # Recuperar de session_state si ya existen
-    if "openai_api_key" in st.session_state:
-        api_key = st.session_state.openai_api_key
+    # 2. Intentar obtener de secrets.toml
+    if not assistant_id and hasattr(st, "secrets") and "ASSISTANT_ID" in st.secrets:
+        assistant_id = st.secrets["ASSISTANT_ID"]
 
-    if "assistant_id" in st.session_state:
-        assistant_id = st.session_state.assistant_id
-
-    if "openai_model" in st.session_state:
-        model = st.session_state.openai_model
-
-    # 1. Verificar variables de entorno si aún no tenemos las claves
-    if not api_key:
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if api_key:
-            logging.info("API key cargada desde variables de entorno")
-            st.session_state.openai_api_key = api_key
-
+    # 3. Solicitar al usuario
     if not assistant_id:
-        assistant_id = os.environ.get("ASSISTANT_ID")
-        if assistant_id:
-            logging.info("Assistant ID cargado desde variables de entorno")
-            st.session_state.assistant_id = assistant_id
+        assistant_id = st.text_input("ID del Asistente", type="password", help="Ingrese el ID del asistente de OpenAI")
 
-    if not model:
-        model = os.environ.get("OPENAI_API_MODEL", "gpt-4o-mini")
-        if model:
-            logging.info(f"Modelo cargado desde variables de entorno: {model}")
-            st.session_state.openai_model = model
-
-    # 2. Verificar secrets.toml si existe y aún necesitamos configuración
-    if not api_key or not assistant_id or not model:
-        try:
-            if (
-                hasattr(st, "secrets")
-                and "OPENAI_API_KEY" in st.secrets
-                and not api_key
-            ):
-                api_key = st.secrets["OPENAI_API_KEY"]
-                logging.info("API key cargada desde secrets")
-                st.session_state.openai_api_key = api_key
-
-            if (
-                hasattr(st, "secrets")
-                and "ASSISTANT_ID" in st.secrets
-                and not assistant_id
-            ):
-                assistant_id = st.secrets["ASSISTANT_ID"]
-                logging.info(f"ID del asistente cargado desde secrets")
-                st.session_state.assistant_id = assistant_id
-
-            if (
-                hasattr(st, "secrets")
-                and "OPENAI_API_MODEL" in st.secrets
-                and not model
-            ):
-                model = st.secrets["OPENAI_API_MODEL"]
-                logging.info(f"Modelo cargado desde secrets: {model}")
-                st.session_state.openai_model = model
-            elif not model:
-                model = "gpt-4o-mini"  # Valor predeterminado seguro
-                st.session_state.openai_model = model
-                logging.info(f"Usando modelo predeterminado: {model}")
-
-        except Exception as e:
-            logging.warning(f"Error accediendo a secrets: {str(e)}")
-            if not model:
-                model = (
-                    "gpt-4o-mini"  # Asegurar que siempre hay un modelo predeterminado
-                )
-                st.session_state.openai_model = model
-
-    # 3. Configuración en sidebar con validación
-    with st.sidebar:
-        with st.expander(
-            "⚖️ Configuración de Conexión", expanded=not (api_key and assistant_id)
-        ):
-            if not api_key:
-                input_api_key = st.text_input("Clave API de OpenAI", type="password")
-                if input_api_key:
-                    api_key = input_api_key
-                    st.session_state.openai_api_key = api_key
-
-            if not assistant_id:
-                input_assistant_id = st.text_input(
-                    "ID del asistente OpenAI", type="password"
-                )
-                if input_assistant_id:
-                    assistant_id = input_assistant_id
-                    st.session_state.assistant_id = assistant_id
-
-            # Mostrar el modelo configurado
-            st.info(
-                f"Modelo configurado: {st.session_state.get('openai_model', 'gpt-4o-mini')}"
-            )
-            
-            # Opción de diagnóstico
-            if "openai_client_error" in st.session_state:
-                st.error(f"Error del cliente: {st.session_state.openai_client_error}")
-                if st.button("Reintentar conexión"):
-                    if "openai_client_error" in st.session_state:
-                        del st.session_state["openai_client_error"]
-                    st.rerun()
-
-            # Entorno detectado
-            environment = detect_environment()
-            st.info(f"Entorno detectado: {environment}")
-
-    # 4. Validación y configuración del cliente
-    if api_key and assistant_id:
-        try:
-            # Usar la nueva función para crear el cliente compatible
-            client = create_openai_client(api_key)
-
-            # Eliminamos cualquier error anterior si la creación fue exitosa
-            if "openai_client_error" in st.session_state:
-                del st.session_state["openai_client_error"]
-
-            # Establecer el cliente como conectado sin pruebas adicionales
-            # para minimizar errores en Streamlit Cloud
-            logging.info(f"Cliente OpenAI inicializado con configuración optimizada")
-            st.session_state.openai_connected = True
-            return client, assistant_id, True
-
-        except Exception as e:
-            logging.error(f"Error validando credenciales OpenAI: {str(e)}")
-            st.sidebar.error(f"Error de API OpenAI: {str(e)}")
-            st.session_state.openai_connected = False
-            
-            # Guardar el error para diagnóstico y recuperación
-            st.session_state.openai_client_error = str(e)
-            
-            return None, None, False
+    # Verificar configuración
+    if openai_api_key and mistral_api_key and assistant_id:
+        st.success("✅ Configuración completa")
     else:
         missing = []
-        if not api_key:
-            missing.append("API key")
+        if not openai_api_key:
+            missing.append("API Key de OpenAI")
+        if not mistral_api_key:
+            missing.append("API Key de Mistral")
         if not assistant_id:
-            missing.append("ID del asistente")
+            missing.append("ID del Asistente")
+        st.warning(f"⚠️ Falta configurar: {', '.join(missing)}")
 
-        error_msg = f"Falta{'n' if len(missing) > 1 else ''}: {', '.join(missing)}"
-        logging.warning(error_msg)
-        st.session_state.openai_connected = False
-        return None, None, False
-
-
-# ----- SISTEMA DE RECUPERACIÓN DE FALLOS EN HILOS -----
-
-def repair_thread_issues():
-    """
-    Intenta reparar problemas comunes con el hilo de conversación.
-    Retorna True si se realizó alguna reparación.
-    """
-    if not st.session_state.get("thread_id"):
-        return False  # Nada que reparar aún
+    # Mostrar entorno
+    env_type = "Streamlit Cloud" if is_streamlit_cloud() else "Local"
+    st.info(f"Entorno detectado: {env_type}")
     
-    # Verificar si hay un cliente disponible para hacer reparaciones
-    if not st.session_state.get("openai_api_key") or "openai_client_error" in st.session_state:
-        return False
-    
-    try:
-        client = create_openai_client(st.session_state.get("openai_api_key"))
+    # Opciones de exportación de chat
+    st.subheader("💾 Exportar Conversación")
+    # export_format = st.radio("Formato de exportación:", ("Markdown", "PDF"))
+    export_format = st.radio("Formato de exportación:", ("Markdown"))
+
+    if st.button("Descargar conversación"):
+        if "messages" in st.session_state and st.session_state.messages:
+            if export_format == "Markdown":
+                md_content = export_chat_to_markdown(st.session_state.messages)
+                b64 = base64.b64encode(md_content.encode()).decode()
+                href = f'<a href="data:text/markdown;base64,{b64}" download="consentlex_conversation.md">Descargar archivo Markdown</a>'
+                st.markdown(href, unsafe_allow_html=True)
+            else:  # PDF
+                try:
+                    with st.spinner("Generando PDF..."):
+                        try:
+                            # Sistema de generación multicapa
+                            content, content_type = export_chat_to_pdf(st.session_state.messages)
+                            if content_type == "pdf":
+                                b64 = base64.b64encode(content).decode()
+                                href = f'<a href="data:application/pdf;base64,{b64}" download="consentlex_conversation.pdf">Descargar archivo PDF</a>'
+                                st.markdown(href, unsafe_allow_html=True)
+                            else:
+                                # Si devuelve markdown, mostrar alternativa
+                                b64 = content  # Ya viene en base64
+                                href = f'<a href="data:text/markdown;base64,{b64}" download="consentlex_conversation.md">Descargar archivo Markdown</a>'
+                                st.markdown(href, unsafe_allow_html=True)
+                                st.warning("No se pudo generar el PDF. Se ha creado un archivo markdown en su lugar.")
+                        except Exception as e:
+                            st.error(f"Error durante la exportación: {str(e)}")
+                            logging.error(f"Error detallado: {traceback.format_exc()}")
+                except Exception as e:
+                    st.error(f"Error al generar PDF: {str(e)}")
+        else:
+            st.warning("No hay conversación para exportar.")
+
+    # Administrador de contexto de documentos
+    st.subheader("📄 Gestión de Documentos")
+    manage_document_context()
+
+    # Botón para limpiar la sesión actual
+    if st.button("🧹 Limpiar sesión actual", type="secondary", help="Elimina todos los archivos y datos de la sesión actual"):
+        with st.spinner("Limpiando recursos de la sesión..."):
+            result = clean_current_session()
+            if isinstance(result, dict) and "error" not in result:
+                st.success(f"Sesión limpiada: {result['documents']} documentos, {result['messages']} mensajes")
+            else:
+                st.error("No se pudo limpiar la sesión completamente")
+            rerun_app()
+
+    # Documentos cargados
+    if "uploaded_files" in st.session_state and st.session_state.uploaded_files:
+        st.subheader("📚 Documentos disponibles")
+        for idx, filename in enumerate(st.session_state.uploaded_files):
+            st.markdown(f"📄 **{filename}**")
         
-        # Verificar si el thread existe y es válido
-        try:
-            # Intento de recuperar el thread para verificar que existe y es válido
-            thread = client.beta.threads.retrieve(thread_id=st.session_state.get("thread_id"))
-            logging.info(f"Thread verificado y válido: {thread.id}")
-            return False  # No se necesitó reparación
-        except Exception as e:
-            logging.warning(f"Error al verificar thread: {str(e)}. Intentando recrear...")
-            
-            # El thread no existe o hay otro problema, crear uno nuevo
-            try:
-                thread = client.beta.threads.create()
-                if hasattr(thread, "id"):
-                    st.session_state.thread_id = thread.id
-                    logging.info(f"Thread reparado: {thread.id}")
-                    return True  # Reparación exitosa
-                else:
-                    logging.error("Respuesta incompleta al crear thread de reparación")
-                    return False
-            except Exception as create_error:
-                logging.error(f"Error al crear thread de reparación: {str(create_error)}")
-                return False
-    except Exception as client_error:
-        logging.error(f"Error al crear cliente para reparación: {str(client_error)}")
-        return False
+        st.info("Estos documentos están disponibles para consulta en la conversación.")
+    
+    # Área informativa - Trasladada desde el cuerpo principal
+    st.markdown("---")
+    st.subheader("⚖️ Sobre ConsentLex")
+    st.markdown("""
+    **ConsentLex** es un sistema experto para el análisis y creación de consentimientos informados médico-legales.
+    
+    Puede ayudarle con:
+    
+    * 📋 **Evaluación de consentimientos existentes**: Análisis de legalidad y conformidad normativa
+    * 📝 **Creación de nuevos consentimientos**: Desarrollo de documentos personalizados según procedimiento
+    * ⚕️ **Asesoría en casos específicos**: Consultas sobre situaciones médico-legales complejas
+    * 📚 **Interpretación normativa**: Aclaración de requisitos legales vigentes
+    * 🔍 **Identificación de riesgos**: Detección de posibles vulnerabilidades en documentos
+    """)
 
+    # Añadir información de uso
+    st.markdown("---")
+    st.subheader("💡 Cómo usar ConsentLex")
+    st.markdown("""
+    1. **Consultas generales**: Escriba su pregunta en el chat para recibir información sobre normativa y mejores prácticas.
+    
+    2. **Análisis de documentos**: Adjunte un documento de consentimiento informado (.pdf, .docx, .txt, imágenes) en el chat para que sea analizado.
+    
+    3. **Creación de documentos**: Solicite la creación de un nuevo consentimiento informado especificando el procedimiento médico, perfil de pacientes y contexto institucional.
+    """)
+    
+    # Instrucciones para documentos
+    st.markdown("---")
+    st.subheader("📄 Procesamiento de documentos")
+    st.info("""
+    Esta aplicación utiliza la tecnología OCR de Mistral para:
+    
+    - Extraer texto y contenido estructurado de documentos PDF
+    - Analizar automáticamente el contenido de documentos
+    - Recuperar información relevante para responder consultas
+    
+    **Nota sobre privacidad**: Los documentos se procesan localmente y no se almacenan permanentemente.
+    """)
 
-# ----- ESTILOS CSS PERSONALIZADOS -----
+    # Añadir créditos
+    st.markdown("---")
+    st.subheader("Desarrollado por:")
+    st.markdown("Equipo Jurídico-Médico González Páez Abogados")
+    st.markdown(
+        "[Sitio web](https://gonzalezpaezabogados.co/) | [Documentación](#)"
+    )
+    
+    # Footer en la barra lateral
+    st.markdown("---")
+    st.markdown(
+        f"""
+        <div style="color: #666666; font-size: 0.8rem;">
+            <p>ConsentLex v{APP_VERSION} | {datetime.now().strftime('%Y-%m-%d')}</p>
+            <p>Basado en la 'Guía Completa para el Control de Legalidad y Elaboración de Consentimientos Informados'.</p>
+            <p>Las interacciones cumplen con las normas de confidencialidad médica.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-# Definición de colores tema legal
-COLORS = {
-    "primary": "#2F4F4F",  # Verde oscuro (profesional legal)
-    "secondary": "#192841",  # Azul marino (confianza)
-    "accent1": "#6B8E23",  # Verde oliva (documentos legales)
-    "accent2": "#CD853F",  # Marrón (sellos legales)
-    "light": "#F5F5F5",  # Blanco humo (papel)
-    "dark": "#333333",  # Gris oscuro (tinta)
-    "gradient1": "#2F4F4F",  # Verde oscuro
-    "gradient2": "#4682B4",  # Azul acero
-    "error": "#8B0000",  # Rojo oscuro para errores
-    "warning": "#DAA520",  # Dorado para advertencias
-    "success": "#2E8B57",  # Verde mar para éxito
-}
-
-# CSS personalizado con soporte para modo oscuro
-css = f"""
-<style>
-    /* Estilos Generales */
-    .main .block-container {{
-        padding-top: 2rem;
-        padding-bottom: 3rem;
-    }}
-    
-    /* Encabezado */
-    .legal-header {{
-        background: linear-gradient(135deg, {COLORS["gradient1"]}, {COLORS["gradient2"]});
-        border-radius: 10px;
-        padding: 1.5rem;
-        margin-bottom: 2rem;
-        color: white !important;
-        text-align: center;
-        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
-    }}
-    
-    .dark-mode .legal-header {{
-        box-shadow: 0 4px 15px rgba(255, 255, 255, 0.1);
-    }}
-    
-    /* Estilo para mensajes de chat */
-    .chat-message {{
-        padding: 1.5rem;
-        border-radius: 10px;
-        margin-bottom: 1rem;
-        animation: fadeIn 0.5s;
-        overflow-wrap: break-word;
-    }}
-    
-    .user-message {{
-        background-color: {COLORS["light"]};
-        border-left: 5px solid {COLORS["primary"]};
-        color: #333;
-    }}
-    
-    .dark-mode .user-message {{
-        background-color: rgba(245, 245, 245, 0.15);
-        color: #f0f0f0;
-    }}
-    
-    .assistant-message {{
-        background: linear-gradient(to right, {COLORS["light"]}, #ffffff);
-        border-left: 5px solid {COLORS["accent1"]};
-        color: #333;
-    }}
-    
-    .dark-mode .assistant-message {{
-        background: linear-gradient(to right, rgba(245, 245, 245, 0.15), rgba(255, 255, 255, 0.05));
-        color: #f0f0f0;
-    }}
-    
-    @keyframes fadeIn {{
-        from {{ opacity: 0; transform: translateY(10px); }}
-        to {{ opacity: 1; transform: translateY(0); }}
-    }}
-    
-    /* Estilo para el chat input */
-    .stTextInput div div {{
-        border-radius: 5px !important;
-        border: 2px solid {COLORS["accent1"]};
-        box-shadow: 0 2px 10px rgba(47, 79, 79, 0.1);
-        transition: all 0.3s ease;
-    }}
-    
-    .stTextInput div div:focus-within {{
-        border: 2px solid {COLORS["primary"]};
-        box-shadow: 0 2px 15px rgba(47, 79, 79, 0.2);
-    }}
-    
-    /* Estilos para Sidebar */
-    .sidebar .sidebar-content {{
-        background: linear-gradient(180deg, {COLORS["dark"]}, {COLORS["primary"]});
-        color: white;
-    }}
-    
-    /* Estilo para tarjetas informativas */
-    .info-card {{
-        background-color: white;
-        border-radius: 10px;
-        padding: 1.5rem;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        margin-bottom: 1rem;
-        border-top: 5px solid {COLORS["accent2"]};
-        transition: transform 0.3s ease;
-    }}
-    
-    .dark-mode .info-card {{
-        background-color: rgba(51, 51, 51, 0.7);
-        box-shadow: 0 4px 6px rgba(255, 255, 255, 0.05);
-    }}
-    
-    .info-card:hover {{
-        transform: translateY(-5px);
-    }}
-    
-    /* Estilo para citas legales */
-    .tip-card {{
-        background: linear-gradient(135deg, {COLORS["dark"]}, {COLORS["primary"]});
-        border-radius: 10px;
-        padding: 1.5rem;
-        color: white !important;
-        margin: 2rem 0;
-        font-style: italic;
-        text-align: center;
-        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
-    }}
-    
-    .dark-mode .tip-card {{
-        box-shadow: 0 4px 15px rgba(255, 255, 255, 0.05);
-    }}
-
-    /* Estado de conexión */
-    .connection-status {{
-        display: inline-block;
-        padding: 0.3rem 0.8rem;
-        border-radius: 0.5rem;
-        font-size: 0.8rem;
-        font-weight: bold;
-        margin-right: 0.5rem;
-    }}
-    
-    .status-connected {{
-        background-color: {COLORS["success"]};
-        color: white !important;
-    }}
-    
-    .status-disconnected {{
-        background-color: {COLORS["error"]};
-        color: white !important;
-    }}
-    
-    .status-warning {{
-        background-color: {COLORS["warning"]};
-        color: black !important;
-    }}
-    
-    /* Pantalla de configuración */
-    .config-screen {{
-        text-align: center; 
-        padding: 2rem; 
-        background: linear-gradient(135deg, #f5f7fa, #e4e8ec); 
-        border-radius: 10px; 
-        margin: 2rem 0;
-    }}
-    
-    .dark-mode .config-screen {{
-        background: linear-gradient(135deg, rgba(51, 51, 51, 0.6), rgba(25, 40, 65, 0.8));
-    }}
-    
-    /* Detección y aplicación de modo oscuro */
-    @media (prefers-color-scheme: dark) {{
-        body {{
-            background-color: #121212;
-            color: #f0f0f0;
-        }}
+# Detener si no tenemos la configuración completa
+if not openai_api_key or not mistral_api_key or not assistant_id:
+    st.markdown(
+        """
+        ## ⚙️ Configuración necesaria
         
-        .dark-mode-indicator {{
-            display: block;
-        }}
-    }}
-    
-    /* Mejoras de legibilidad para todos los temas */
-    strong, b {{
-        color: {COLORS["accent2"]} !important;
-    }}
-    
-    .stButton button {{
-        border-radius: 5px;
-        padding: 0.5rem 1.5rem;
-        font-weight: bold;
-        transition: all 0.3s ease;
-    }}
-    
-    .stButton button:hover {{
-        transform: translateY(-2px);
-        box-shadow: 0 4px 10px rgba(47, 79, 79, 0.3);
-    }}
+        Por favor, completa la configuración en la barra lateral para usar ConsentLex:
+        
+        1. **API Key de OpenAI**: Necesaria para conectar con el servicio
+        2. **API Key de Mistral**: Necesaria para el procesamiento OCR de documentos
+        3. **ID del Asistente**: Identifica el asistente de OpenAI a utilizar
+        
+        Una vez configurado, podrás interactuar con el sistema experto.
+        """
+    )
+    st.stop()
 
-    /* Estilos para mensajes de diagnóstico */
-    .diagnostic-message {{
-        padding: 10px;
-        border-radius: 8px;
-        margin-bottom: 10px;
-        font-size: 0.9rem;
-    }}
-    
-    .diagnostic-info {{
-        background-color: rgba(70, 130, 180, 0.2);
-        border-left: 3px solid {COLORS["accent1"]};
-    }}
-    
-    .diagnostic-warning {{
-        background-color: rgba(218, 165, 32, 0.2);
-        border-left: 3px solid {COLORS["warning"]};
-    }}
-    
-    .diagnostic-error {{
-        background-color: rgba(139, 0, 0, 0.2);
-        border-left: 3px solid {COLORS["error"]};
-    }}
-    
-    /* Estilos para tarjeta de recuperación */
-    .recovery-card {{
-        background: linear-gradient(135deg, #fff8e1, #fffde7);
-        border-radius: 10px;
-        padding: 1.5rem;
-        margin: 1rem 0;
-        border-left: 5px solid {COLORS["warning"]};
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-    }}
-    
-    .dark-mode .recovery-card {{
-        background: linear-gradient(135deg, rgba(50, 50, 10, 0.3), rgba(60, 60, 15, 0.4));
-        box-shadow: 0 2px 8px rgba(255, 255, 255, 0.05);
-    }}
-    
-    /* Estilos para mensajes de error y recuperación */
-    .error-message {{
-        color: {COLORS["error"]};
-        font-weight: bold;
-        margin-bottom: 10px;
-    }}
-    
-    .recovery-message {{
-        color: {COLORS["success"]};
-        font-weight: bold;
-        margin-bottom: 10px;
-    }}
-    
-    /* Estilos para tooltips informativos */
-    .tooltip {{
-        position: relative;
-        display: inline-block;
-        cursor: help;
-    }}
-    
-    .tooltip .tooltiptext {{
-        visibility: hidden;
-        width: 200px;
-        background-color: #555;
-        color: #fff;
-        text-align: center;
-        border-radius: 6px;
-        padding: 5px;
-        position: absolute;
-        z-index: 1;
-        bottom: 125%;
-        left: 50%;
-        margin-left: -100px;
-        opacity: 0;
-        transition: opacity 0.3s;
-    }}
-    
-    .tooltip:hover .tooltiptext {{
-        visibility: visible;
-        opacity: 1;
-    }}
-    
-    /* Estilos para el área de carga de archivos */
-    .upload-area {{
-        border: 2px dashed {COLORS["accent1"]};
-        border-radius: 10px;
-        padding: 20px;
-        text-align: center;
-        margin-bottom: 20px;
-        transition: background-color 0.3s;
-    }}
-    
-    .upload-area:hover {{
-        background-color: rgba(107, 142, 35, 0.1);
-    }}
-    
-    /* Estilos para secciones de análisis de documentos */
-    .analysis-section {{
-        background-color: rgba(245, 245, 245, 0.7);
-        border-radius: 10px;
-        padding: 15px;
-        margin: 15px 0;
-        border-left: 4px solid {COLORS["primary"]};
-    }}
-    
-    .dark-mode .analysis-section {{
-        background-color: rgba(51, 51, 51, 0.4);
-    }}
-    
-    /* Estilos para iconos de resultados */
-    .result-icon {{
-        font-size: 1.2rem;
-        margin-right: 10px;
-        vertical-align: middle;
-    }}
-    
-    .result-success {{
-        color: {COLORS["success"]};
-    }}
-    
-    .result-warning {{
-        color: {COLORS["warning"]};
-    }}
-    
-    .result-error {{
-        color: {COLORS["error"]};
-    }}
-</style>
+# ----- INICIALIZACIÓN DE ESTADO -----
 
-<script>
-    // Detectar tema oscuro
-    function detectDarkMode() {{
-        if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {{
-            document.body.classList.add('dark-mode');
-        }}
-    }}
-    
-    // Ejecutar al cargar
-    window.addEventListener('DOMContentLoaded', detectDarkMode);
-    
-    // Escuchar cambios en el tema
-    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {{
-        if (e.matches) {{
-            document.body.classList.add('dark-mode');
-        }} else {{
-            document.body.classList.remove('dark-mode');
-        }}
-    }});
-</script>
-"""
-
-# Inyectar CSS
-st.markdown(css, unsafe_allow_html=True)
-
-# ----- INICIALIZACIÓN DE SESIÓN -----
-
-# Inicialización de variables de estado
+# Inicializar variables de estado
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = None
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "app_version" not in st.session_state:
-    st.session_state.app_version = APP_VERSION
+if "uploaded_files" not in st.session_state:
+    st.session_state.uploaded_files = []
 
-if "last_update" not in st.session_state:
-    st.session_state.last_update = LAST_UPDATE
+if "document_contents" not in st.session_state:
+    st.session_state.document_contents = {}
 
-if "recovery_attempts" not in st.session_state:
-    st.session_state.recovery_attempts = 0
+if "file_metadata" not in st.session_state:
+    st.session_state.file_metadata = {}
 
-if "active_file" not in st.session_state:
-    st.session_state.active_file = None
+# Crear clientes
+openai_client = create_openai_client(openai_api_key)
 
-# ----- SIDEBAR: INFORMACIÓN DE CONSENTLEX -----
-
-with st.sidebar:
-    # Encabezado de la barra lateral
-    st.title("⚖️ ConsentLex")
-    st.markdown("### Experto en Consentimiento Informado")
-
-    # Animación Lottie para la sidebar (solo si está disponible)
-    if LOTTIE_AVAILABLE:
-        try:
-            lottie_legal = load_sidebar_lottie()
-            if lottie_legal:
-                st_lottie(lottie_legal, speed=0.7, height=150, key="sidebar_lottie")
-            else:
-                st.image("https://via.placeholder.com/150x150.png?text=⚖️", width=150)
-        except Exception as e:
-            logging.warning(f"No se pudo cargar la animación de sidebar: {str(e)}")
-            st.image("https://via.placeholder.com/150x150.png?text=⚖️", width=150)
-    else:
-        st.image("https://via.placeholder.com/150x150.png?text=⚖️", width=150)
-
-    # Menú de navegación (usando option_menu si está disponible, o selectbox si no)
-    if OPTION_MENU_AVAILABLE:
-        try:
-            selected = option_menu(
-                menu_title=None,
-                options=[
-                    "Inicio",
-                    "Evaluación",
-                    "Creación",
-                    "Normativa",
-                    "Diagnóstico",
-                ],
-                icons=["house", "clipboard-check", "file-earmark-text", "book", "gear"],
-                menu_icon="scale-balanced",
-                default_index=0,
-                styles={
-                    "container": {
-                        "padding": "0!important",
-                        "background-color": "transparent",
-                    },
-                    "icon": {"color": COLORS["accent2"], "font-size": "14px"},
-                    "nav-link": {
-                        "font-size": "14px",
-                        "text-align": "left",
-                        "margin": "0px",
-                        "--hover-color": COLORS["light"],
-                    },
-                    "nav-link-selected": {"background-color": COLORS["secondary"]},
-                },
-            )
-        except Exception as e:
-            logging.warning(f"Error al cargar menú personalizado: {str(e)}")
-            selected = st.selectbox(
-                "Navegación",
-                [
-                    "Inicio",
-                    "Evaluación",
-                    "Creación",
-                    "Normativa",
-                    "Diagnóstico",
-                ],
-            )
-    else:
-        selected = st.selectbox(
-            "Navegación",
-            [
-                "Inicio",
-                "Evaluación",
-                "Creación",
-                "Normativa",
-                "Diagnóstico",
-            ],
-        )
-
-    # Contenido basado en la selección del menú
-    if selected == "Inicio":
-        st.markdown("### Bienvenido a ConsentLex")
-        st.markdown(
-            """
-        Sistema experto especializado en análisis, creación y mejora de consentimientos informados médico-legales.
-        
-        Utilice este asistente para garantizar que sus documentos cumplan con todas las normativas vigentes.
-        """
-        )
-
-    elif selected == "Evaluación":
-        st.markdown(
-            """
-        ### Análisis de Consentimientos
-        
-        Servicios de evaluación:
-        
-        * ⚖️ **Control de legalidad** completo
-        * 📋 **Verificación de conformidad** normativa 
-        * 🔍 **Identificación** de riesgos y vulnerabilidades
-        * 📊 **Informe detallado** con oportunidades de mejora
-        * 📝 **Recomendaciones** específicas y fundamentadas
-        
-        Para iniciar una evaluación, cargue un documento de consentimiento existente o consúlteme sobre aspectos específicos.
-        """
-        )
-
-    elif selected == "Creación":
-        st.markdown(
-            """
-        ### Creación de Consentimientos
-        
-        Servicios de desarrollo:
-        
-        * 📑 **Creación personalizada** por procedimiento
-        * 🔤 **Redacción clara** y accesible para pacientes
-        * ✅ **Inclusión** de todos los elementos legales requeridos
-        * 🧩 **Adaptación** a contextos especiales (menores, urgencias)
-        * 📤 **Entrega** en formato editable y listo para uso
-        
-        Para crear un nuevo consentimiento, especifique el tipo de procedimiento médico, el perfil de pacientes y el contexto institucional.
-        """
-        )
-
-    elif selected == "Normativa":
-        st.markdown(
-            """
-        ### Normativa Aplicable
-        
-        Referencias legales:
-        
-        * 📜 **Ley 23 de 1981** (Ética Médica)
-        * 📜 **Resolución 13437 de 1991** (Derechos de los Pacientes)
-        * 📜 **Resolución 8430 de 1993** (Normas Científicas para Investigación)
-        * 📜 **Ley 1751 de 2015** (Ley Estatutaria de Salud)
-        * 📜 **Resolución 229 de 2020** (Derecho a la Información)
-        * 📜 **Resolución 309 de 2025** (Consentimiento en Menores)
-        
-        Para consultas específicas sobre legislación y jurisprudencia, pida detalles sobre la normativa de interés.
-        """
-        )
-
-    elif selected == "Diagnóstico":
-        st.markdown("### Diagnóstico del Sistema")
-        show_diagnostic_panel()
-        show_environment_diagnostic()
-
-    # Consejo legal del día
-    st.markdown(
-        """
-    <div class="tip-card">
-        "{}"
-    </div>
-    """.format(
-            get_random_legal_tip()
-        ),
-        unsafe_allow_html=True,
-    )
-
-    # Información de versión y última actualización
-    st.markdown("---")
-    st.markdown(
-        f"""
-    <div style="text-align: center; font-size: 0.8rem; color: #ffffff88;">
-        Versión {st.session_state.app_version} | Última actualización: {st.session_state.last_update}
-    </div>
-    """,
-        unsafe_allow_html=True,
-    )
-
-    # Créditos
-    st.markdown("---")
-    st.subheader("Equipo de Desarrollo:")
-    st.markdown("Grupo Jurídico-Médico ConsentLex")
-    st.markdown(
-        "[Sitio Web](https://www.consentlex.com) | [Documentación](https://docs.consentlex.com) | [Contacto](mailto:info@consentlex.com)"
-    )
-
-# ----- CONFIGURACIÓN Y VALIDACIÓN -----
-
-# Configurar cliente OpenAI
-client, assistant_id, config_success = setup_openai_client()
-
-# Intentar reparar thread si es necesario
-thread_repaired = repair_thread_issues()
-if thread_repaired:
-    st.success("Conversación reparada exitosamente. Puede continuar normalmente.")
-    # Actualizar cliente si fue necesario
-    client, assistant_id, config_success = setup_openai_client()
-
-# ----- ÁREA PRINCIPAL: CHAT -----
-
-# Cabecera del área de chat
-st.markdown(
-    """
-<div class="legal-header">
-    <h1>⚖️ ConsentLex: Experto en Consentimiento Informado ⚖️</h1>
-    <p>Sistema especializado en evaluación, creación y optimización de consentimientos informados médico-legales</p>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-# Mostrar estado de conexión
-if client and assistant_id:
-    st.markdown(
-        """
-    <div>
-        <span class="connection-status status-connected">Conectado</span>
-        <span>Sistema experto inicializado y listo para brindar asesoría</span>
-    </div>
-    """,
-        unsafe_allow_html=True,
-    )
-else:
-    st.markdown(
-        """
-    <div>
-        <span class="connection-status status-disconnected">Desconectado</span>
-        <span>Por favor configure las credenciales en la sección de Configuración</span>
-    </div>
-    """,
-        unsafe_allow_html=True,
-    )
-
-# Área de carga de documentos
-st.markdown("### Carga de Documentos para Análisis")
-uploaded_file = st.file_uploader(
-    "Cargue un documento de consentimiento informado para su evaluación", 
-    type=["pdf", "docx", "doc", "txt"]
-)
-
-# Manejo del archivo cargado
-if uploaded_file is not None:
-    # Mostrar información del archivo
-    file_details = {
-        "Nombre": uploaded_file.name,
-        "Tipo": uploaded_file.type,
-        "Tamaño": f"{uploaded_file.size / 1024:.2f} KB"
-    }
-    
-    # Verificar si es un archivo nuevo o el mismo
-    if st.session_state.active_file != uploaded_file.name:
-        st.session_state.active_file = uploaded_file.name
-        st.success(f"✅ Documento '{uploaded_file.name}' cargado correctamente")
-        st.info("Puede solicitar el análisis de este documento a través del chat")
-        
-        # Añadir mensaje sugerido al chat
-        suggested_prompt = f"Por favor, analiza el documento '{uploaded_file.name}' que acabo de cargar para verificar su conformidad con la normativa vigente sobre consentimiento informado."
-        
-        # Botón para iniciar análisis automáticamente
-        if st.button("Iniciar análisis del documento"):
-            # Añadir mensaje a la conversación
-            if "messages" not in st.session_state:
-                st.session_state.messages = []
-                
-            st.session_state.messages.append({"role": "user", "content": suggested_prompt})
-            # Reiniciar la app para que procese el mensaje
-            st.rerun()
-    
-    # Mostrar panel con detalles del archivo
-    with st.expander("Detalles del documento cargado", expanded=False):
-        st.json(file_details)
-
-# ----- INICIALIZACIÓN DEL THREAD -----
-
-# Inicializar thread con manejo robusto de errores
-if not st.session_state.thread_id and client and assistant_id:
+# Inicializar thread si no existe
+if not st.session_state.thread_id and openai_client:
     with st.spinner("Inicializando sistema experto..."):
-        try:
-            # Método simplificado para crear thread
-            thread = client.beta.threads.create()
-            if hasattr(thread, "id"):
-                st.session_state.thread_id = thread.id
-                logging.info(f"Thread creado correctamente: {thread.id}")
-                st.success("Sistema experto inicializado correctamente")
-                # Reiniciar conteo de intentos de recuperación
-                st.session_state.recovery_attempts = 0
-                # Usar rerun en lugar de experimental_rerun
-                st.rerun()
-            else:
-                error_msg = "Respuesta incompleta de la API al crear el thread"
-                logging.error(error_msg)
-                st.error(f"Error: {error_msg}")
-        except Exception as e:
-            detailed_error = str(e)
-            logging.error(f"Error detallado al crear thread: {detailed_error}")
+        thread_id = initialize_thread(openai_client)
+        if thread_id:
+            st.session_state.thread_id = thread_id
+            st.success("⚖️ Sistema experto inicializado correctamente ⚖️")
 
-            # Proporcionar mensajes más descriptivos basados en el tipo de error
-            if "401" in detailed_error or "authentication" in detailed_error.lower():
-                error_msg = "Error de autenticación. Verifique que su API key sea válida y esté activa."
-            elif "429" in detailed_error or "rate limit" in detailed_error.lower():
-                error_msg = "Ha alcanzado el límite de solicitudes de la API. Intente nuevamente en unos minutos."
-            elif "500" in detailed_error or "server error" in detailed_error.lower():
-                error_msg = "Error del servidor de OpenAI. El servicio podría estar experimentando problemas temporales."
-            elif (
-                "connect" in detailed_error.lower()
-                or "timeout" in detailed_error.lower()
-            ):
-                error_msg = "Error de conexión. Verifique su conexión a Internet e intente nuevamente."
-            else:
-                error_msg = f"Error al inicializar thread: {detailed_error}"
+# ----- INTERFAZ DE CHAT -----
 
-            st.error(error_msg)
-            # Incrementar contador de intentos de recuperación
-            st.session_state.recovery_attempts += 1
-            
-            # Sugerir acciones de recuperación específicas
-            if st.session_state.recovery_attempts > 1:
-                st.markdown(
-                    """
-                    <div class="recovery-card">
-                        <h4>Acciones de recuperación sugeridas:</h4>
-                        <ul>
-                            <li>Verifique su conexión a Internet</li>
-                            <li>Asegúrese de que la API key sea válida</li>
-                            <li>Intente recargar la página</li>
-                            <li>Si el problema persiste, use el botón de "Reinicio Completo" en la sección de Diagnóstico</li>
-                        </ul>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-            
-            # Opción para reintentar
-            if st.button("Reintentar inicialización"):
-                st.rerun()
+# Contenedor de historial de chat - mostrar mensajes previos
+chat_history_container = st.container()
 
-# Verificar el estado del hilo de conversación antes de continuar
-ready, errors, warnings = check_app_readiness()
-
-# Mostrar pantalla de configuración si no está listo
-if not ready:
-    st.markdown(
-        """
-    <div class="config-screen">
-        <h2>⚙️ Configuración necesaria</h2>
-        <p>Por favor complete la configuración para comenzar a usar el sistema experto.</p>
-    </div>
-    """,
-        unsafe_allow_html=True,
-    )
-
-    for error in errors:
-        st.error(error)
-
-    for warning in warnings:
-        st.warning(warning)
-
-    # Guía visual de configuración
-    st.markdown(
-        """
-    ### Pasos para configurar la aplicación:
-    1. Abra la sección "⚖️ Configuración de Conexión" en la barra lateral
-    2. Ingrese su clave API de OpenAI
-    3. Ingrese el ID del asistente configurado para ConsentLex
-    4. Refresque la página después de guardar la configuración
-    """
-    )
-
-    # Detener la ejecución del resto de la app
-    st.stop()
-
-# Área de chat con estilo mejorado
-chat_container = st.container()
-
-with chat_container:
-    # Cargar animación de bienvenida solo la primera vez
+with chat_history_container:
+    # Mostrar mensajes previos
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # Mostrar mensaje de bienvenida si no hay mensajes
     if not st.session_state.messages:
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            # Usar Lottie si está disponible, de lo contrario usar imagen estática
-            if LOTTIE_AVAILABLE:
-                try:
-                    lottie_welcome = load_welcome_lottie()
-                    if lottie_welcome:
-                        st_lottie(lottie_welcome, speed=1, height=300, key="welcome")
-                    else:
-                        st.image(
-                            "https://via.placeholder.com/300x300.png?text=⚖️+Bienvenido",
-                            width=300,
-                        )
-                except Exception as e:
-                    logging.error(f"Error mostrando animación de bienvenida: {str(e)}")
-                    st.image(
-                        "https://via.placeholder.com/300x300.png?text=⚖️+Bienvenido",
-                        width=300,
-                    )
-            else:
-                st.image(
-                    "https://via.placeholder.com/300x300.png?text=⚖️+Bienvenido",
-                    width=300,
-                )
+        with st.chat_message("assistant"):
+            st.markdown("""
+            ### ⚖️ Bienvenido a ConsentLex
 
-            st.markdown(
-                """
-            <div style="text-align: center; margin-bottom: 30px;">
-                <h3>¿Cómo puedo ayudarle con su consentimiento informado?</h3>
-                <p>Consulte sobre evaluación, creación o normativa relacionada con consentimientos informados</p>
-            </div>
-            """,
-                unsafe_allow_html=True,
-            )
-
-    # Mostrar mensajes del chat con estilos personalizados
-    for idx, message in enumerate(st.session_state.messages):
-        if message["role"] == "user":
-            st.markdown(
-                f"""
-            <div class="chat-message user-message">
-                <b>Usted:</b> {message["content"]}
-            </div>
-            """,
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f"""
-            <div class="chat-message assistant-message">
-                <b>ConsentLex:</b> {message["content"]}
-            </div>
-            """,
-                unsafe_allow_html=True,
-            )
-
-# ----- PROCESAMIENTO DEL INPUT DEL USUARIO -----
-
-# Procesamiento del input del usuario
-prompt = st.chat_input("¿En qué puedo ayudarle con su consentimiento informado?")
-
-@with_error_handling(max_retries=2)
-def process_user_message(prompt, thread_id, client, assistant_id):
-    """
-    Procesa un mensaje del usuario con manejo de errores avanzado.
-    """
-    # Enviar mensaje del usuario con el cliente v2 - sin parámetros adicionales
-    client.beta.threads.messages.create(
-        thread_id=thread_id, role="user", content=prompt
-    )
-
-    # Obtener el modelo configurado
-    model = st.session_state.get("openai_model", "gpt-4o-mini")
-
-    # Ejecutar con o sin modelo específico en un solo intento
-    # Primero intentamos con el modelo específico, luego fallback al predeterminado
-    try:
-        if model and model != "":
-            try:
-                run = client.beta.threads.runs.create(
-                    thread_id=thread_id,
-                    assistant_id=assistant_id,
-                    model=model,  # Incluimos el modelo solo si está definido
-                )
-                logging.info(f"Iniciando run con modelo: {model}")
-            except Exception as model_error:
-                logging.warning(
-                    f"Error con modelo específico, usando default: {str(model_error)}"
-                )
-                run = client.beta.threads.runs.create(
-                    thread_id=thread_id, assistant_id=assistant_id
-                )
-        else:
-            run = client.beta.threads.runs.create(
-                thread_id=thread_id, assistant_id=assistant_id
-            )
-            logging.info("Iniciando run con modelo predeterminado del asistente")
-    except Exception as e:
-        # Si hay un error al crear el run, intentamos un método más directo
-        logging.warning(f"Error al crear run: {str(e)}. Intentando método alternativo...")
-        # Intento alternativo con parámetros minimizados
-        run = client.beta.threads.runs.create(
-            thread_id=thread_id, 
-            assistant_id=assistant_id
-        )
-    
-    return run
-
-
-@with_error_handling()
-def wait_for_run_completion(client, thread_id, run_id, timeout=60):
-    """
-    Espera la finalización de un run con manejo de timeout y
-    reintentos automáticos si hay problemas de red.
-    """
-    start_time = time.time()
-    poll_interval = 1.5  # segundos entre verificaciones de estado
-    
-    while True:
-        elapsed_time = time.time() - start_time
-        if elapsed_time > timeout:
-            raise TimeoutError(f"La espera excedió el tiempo límite de {timeout} segundos")
-        
-        try:
-            run = client.beta.threads.runs.retrieve(
-                thread_id=thread_id, run_id=run_id
-            )
+            Soy su experto en consentimiento informado médico-legal. ¿En qué puedo ayudarle hoy?
             
-            if run.status in ["completed", "failed", "expired", "cancelled"]:
-                return run
-            
-        except Exception as e:
-            logging.warning(f"Error al verificar estado de run: {str(e)}")
-            # Si hay un error de red, incrementamos el intervalo pero seguimos intentando
-            poll_interval = min(poll_interval * 1.5, 5)
-            
-            # Si ya pasamos la mitad del timeout con errores, reducimos el tiempo total
-            if elapsed_time > (timeout / 2):
-                timeout = elapsed_time + 10  # 10 segundos más desde ahora
-        
-        # Pausar antes de la siguiente verificación
-        time.sleep(poll_interval)
+            * Puede consultarme sobre normativa y requisitos legales
+            * Enviarme un documento para análisis (PDF, DOCX, TXT, imágenes)
+            * Solicitar ayuda para crear un nuevo consentimiento informado
+            """)
 
-
-@with_error_handling()
-def process_assistant_response(client, thread_id, existing_messages):
-    """
-    Procesa la respuesta del asistente con manejo de errores.
-    """
-    try:
-        # Usar opciones mínimas para maximizar compatibilidad
-        messages = client.beta.threads.messages.list(
-            thread_id=thread_id
-        )
-        
-        # Verificar que obtuvimos mensajes
-        if not messages or not hasattr(messages, "data") or len(messages.data) == 0:
-            raise ValueError("No se recibieron mensajes del asistente")
-        
-        # Procesar y mostrar mensajes del asistente
-        new_messages = False
-        for message in messages.data:
-            if message.role == "assistant" and not any(
-                msg["role"] == "assistant"
-                and msg.get("id") == message.id
-                for msg in existing_messages
-            ):
-                # Procesamiento seguro del mensaje
-                full_response = process_message_with_citations(message)
-                response_dict = {
-                    "role": "assistant",
-                    "content": full_response,
-                    "id": message.id,
-                }
-                return response_dict, True
-        
-        # Si no encontramos mensajes nuevos
-        return None, False
-        
-    except Exception as e:
-        logging.error(f"Error procesando respuesta del asistente: {str(e)}")
-        raise
-
-
-if prompt and st.session_state.thread_id and client and assistant_id:
-    # Almacenar mensaje actual para reproducirlo inmediatamente en la UI
-    current_user_msg = {"role": "user", "content": prompt}
-
-    # Añadir mensaje del usuario al historial
-    st.session_state.messages.append(current_user_msg)
-
-    # Reconstruir la UI temporalmente para mostrar el mensaje del usuario
-    with chat_container:
-        # Mostrar todos los mensajes incluyendo el nuevo
-        for idx, message in enumerate(st.session_state.messages):
-            if message["role"] == "user":
-                st.markdown(
-                    f"""
-                <div class="chat-message user-message">
-                    <b>Usted:</b> {message["content"]}
-                </div>
-                """,
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    f"""
-                <div class="chat-message assistant-message">
-                    <b>ConsentLex:</b> {message["content"]}
-                </div>
-                """,
-                    unsafe_allow_html=True,
-                )
-
-    # Mostrar indicador de procesamiento
-    with st.spinner("⚖️ Analizando consulta y revisando normativa aplicable..."):
-        try:
-            # Procesamiento del mensaje con manejo de errores avanzado
-            run = process_user_message(prompt, st.session_state.thread_id, client, assistant_id)
-            
-            # Esperar la finalización del run con reintentos automáticos
-            completed_run = wait_for_run_completion(client, st.session_state.thread_id, run.id)
-            
-            # Verificar si la ejecución se completó correctamente
-            if completed_run.status == "completed":
-                # Recuperar y procesar la respuesta del asistente
-                assistant_response, new_message_found = process_assistant_response(
-                    client, st.session_state.thread_id, st.session_state.messages
-                )
-                
-                if new_message_found and assistant_response:
-                    # Añadir la respuesta al historial de mensajes
-                    st.session_state.messages.append(assistant_response)
-                    # Reiniciar contador de recuperación
-                    st.session_state.recovery_attempts = 0
-                    # Actualizar UI
-                    st.rerun()
-                else:
-                    st.warning("No se recibió respuesta del sistema. Por favor, intente nuevamente.")
-                    # Incrementar contador de recuperación
-                    st.session_state.recovery_attempts += 1
-            else:
-                error_status = completed_run.status
-                error_message = getattr(completed_run, "last_error", "Error desconocido")
-                st.error(f"La solicitud no se completó correctamente. Estado: {error_status}")
-                if error_message:
-                    st.error(f"Error: {error_message}")
-                # Incrementar contador de recuperación
-                st.session_state.recovery_attempts += 1
-                
-                # Si hay múltiples intentos fallidos, ofrecer opciones de recuperación
-                if st.session_state.recovery_attempts > 1:
-                    st.markdown(
-                        """
-                        <div class="recovery-card">
-                            <h4>Opciones de recuperación:</h4>
-                            <p>Se han detectado problemas persistentes. Puede intentar:</p>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button("Reiniciar conversación"):
-                            # Mantener configuración pero reiniciar thread
-                            if "thread_id" in st.session_state:
-                                del st.session_state.thread_id
-                            st.session_state.messages = []
-                            st.session_state.recovery_attempts = 0
-                            st.rerun()
-                    
-                    with col2:
-                        if st.button("Diagnosticar problemas"):
-                            # Redirigir a diagnóstico
-                            st.session_state.recovery_attempts = 0
-                            st.rerun()
-        except Exception as e:
-            logging.error(f"Error en comunicación con OpenAI: {str(e)}")
-            st.error(f"Error: {str(e)}")
-
-            # Sugerencia de solución basada en el tipo de error
-            if "API key" in str(e).lower():
-                st.error(
-                    "Parece haber un problema con la clave API. Verifique que sea válida en la configuración."
-                )
-            elif "rate limit" in str(e).lower():
-                st.warning(
-                    "Ha alcanzado el límite de solicitudes de la API. Intente nuevamente en unos minutos."
-                )
-            elif "network" in str(e).lower() or "timeout" in str(e).lower():
-                st.warning(
-                    "Problema de conexión a Internet. Verifique su conexión e intente nuevamente."
-                )
-            elif "proxies" in str(e).lower():
-                # Mostrar mensaje específico para error de proxies
-                st.error("Error específico relacionado con proxies en el entorno de ejecución.")
-                st.info(
-                    """
-                    Este error puede ocurrir en Streamlit Cloud. Intente las siguientes acciones:
-                    1. Reiniciar la aplicación (botón "Reinicio Completo" en Diagnóstico)
-                    2. Actualizar secrets.toml con credenciales correctas
-                    3. Contactar con soporte si el problema persiste
-                    """
-                )
-                
-                # Ofrecer reinicio forzado para error de proxies
-                if st.button("Reinicio Forzado para Error de Proxies"):
-                    # Solución específica para error de proxies
-                    if "openai_client_error" in st.session_state:
-                        del st.session_state.openai_client_error
-                    
-                    # Forzar entorno a Streamlit Cloud para siguiente intento
-                    os.environ["FORCE_ENVIRONMENT"] = "cloud"
-                    
-                    # Reinicio de aplicación
-                    st.rerun()
-            
-            # Incrementar contador de recuperación
-            st.session_state.recovery_attempts += 1
-            
-            # Si hay múltiples errores, mostrar opciones de recuperación
-            if st.session_state.recovery_attempts > 1:
-                st.markdown(
-                    """
-                    <div class="recovery-card">
-                        <h4>Se han detectado problemas persistentes</h4>
-                        <p>Recomendamos usar los botones de diagnóstico y recuperación en la sección de Diagnóstico.</p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-elif prompt and not (st.session_state.thread_id and client and assistant_id):
-    # Mensaje informativo si faltan componentes necesarios
-    st.warning(
-        "No se puede enviar el mensaje hasta que se complete la configuración y se inicialice el sistema experto."
-    )
-    
-    # Guía visual de configuración
-    st.markdown(
-        """
-    ### Para empezar a conversar:
-    1. Abra la sección "⚖️ Configuración de Conexión" en la barra lateral
-    2. Ingrese su clave API de OpenAI
-    3. Ingrese el ID del asistente configurado para ConsentLex
-    4. Refresque la página si es necesario
-    """
-    )
-
-# ----- FOOTER -----
-st.markdown("---")
-st.markdown(
-    f"""
-    <div style="text-align: center; color: #666666; font-size: 0.8rem;">
-        <p>ConsentLex v{APP_VERSION} | {datetime.now().strftime('%Y-%m-%d')}</p>
-        <p>Este sistema experto está basado en la 'Guía Completa para el Control de Legalidad y Elaboración de Consentimientos Informados'.</p>
-        <p>Las interacciones son procesadas a través de OpenAI y cumplen con las normas de confidencialidad médica.</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
+# Chat input con soporte nativo para adjuntar archivos
+prompt = st.chat_input(
+    "Escriba su consulta sobre consentimientos informados...",
+    accept_file=True,
+    file_type=["pdf", "docx", "txt", "jpg", "jpeg", "png"]
 )
+
+# Procesar la entrada del usuario
+if prompt:
+    # Verificar si hay texto o archivos
+    user_text = ""
+    user_files = []
+    
+    if hasattr(prompt, "text"):
+        user_text = prompt.text
+    
+    if hasattr(prompt, "files") and prompt.files:
+        user_files = prompt.files
+    elif isinstance(prompt, dict) and "files" in prompt and prompt["files"]:
+        user_files = prompt["files"]
+    
+    # Documentos para compartir en el contexto
+    current_doc_contents = {}
+    
+    # Si hay archivos adjuntos, procesarlos con OCR
+    if user_files:
+        with st.spinner("Procesando documentos con OCR..."):
+            for file in user_files:
+                if file.name not in st.session_state.uploaded_files:
+                    st.session_state.uploaded_files.append(file.name)
+                
+                # Leer el contenido del archivo
+                file_bytes = file.read()
+                file.seek(0)  # Restaurar el puntero del archivo
+                
+                # Detectar tipo de documento
+                file_type = detect_document_type(file)
+                
+                # Procesar con OCR de Mistral
+                try:
+                    ocr_results = process_document_with_mistral_ocr(
+                        mistral_api_key, 
+                        file_bytes, 
+                        file_type, 
+                        file.name
+                    )
+                    
+                    if ocr_results and "error" not in ocr_results:
+                        current_doc_contents[file.name] = ocr_results
+                        # Guardar en la sesión para referencia futura
+                        st.session_state.document_contents[file.name] = ocr_results
+                        st.success(f"Documento {file.name} procesado correctamente")
+                    else:
+                        error_msg = ocr_results.get("error", "Error desconocido durante el procesamiento")
+                        st.warning(f"No se pudo extraer texto completo de {file.name}: {error_msg}")
+                        # Aún así, guardamos el resultado para potencial depuración y recuperación parcial
+                        st.session_state.document_contents[file.name] = ocr_results
+                except Exception as e:
+                    st.error(f"Error procesando {file.name}: {str(e)}")
+    
+    # Generar un mensaje automático si solo hay archivos sin texto
+    if not user_text and user_files:
+        file_names = [f.name for f in user_files]
+        user_text = f"He cargado el documento '{', '.join(file_names)}' para análisis. Por favor, analiza su contenido y estructura como consentimiento informado."
+    
+    # Si no hay ni texto ni archivos, no hacemos nada
+    if not user_text and not user_files:
+        st.warning("Por favor, ingrese un mensaje o adjunte un archivo para continuar.")
+    else:
+        # Construir el mensaje para mostrar
+        display_message = user_text
+        if user_files:
+            file_names = [f.name for f in user_files]
+            if user_text:
+                display_message = f"{user_text}\n\n*Archivo adjunto: {', '.join(file_names)}*"
+            else:
+                display_message = f"*Archivo adjunto para análisis: {', '.join(file_names)}*"
+        
+        # Mostrar mensaje del usuario
+        st.session_state.messages.append({"role": "user", "content": display_message})
+        with st.chat_message("user"):
+            st.markdown(display_message)
+        
+        # Procesar la respuesta usando el contenido de los documentos
+        if st.session_state.thread_id and openai_client and assistant_id:
+            try:
+                # Determinar los documentos a incluir en el contexto 
+                response = send_message_with_document_context(
+                    openai_client, 
+                    st.session_state.thread_id, 
+                    assistant_id, 
+                    user_text,
+                    current_doc_contents=current_doc_contents
+                )
+
+                if response:
+                    # Añadir respuesta al historial
+                    st.session_state.messages.append(response)
+                    with st.chat_message("assistant"):
+                        st.markdown(response["content"])
+                else:
+                    st.error("No se pudo obtener respuesta. Por favor, intente de nuevo.")
+            except Exception as e:
+                st.error(f"Error al procesar la respuesta: {str(e)}")
+                logging.error(f"Error procesando respuesta: {traceback.format_exc()}")
+        else:
+            st.error("Error: Sistema no inicializado correctamente.")
